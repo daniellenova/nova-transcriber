@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+from decimal import Decimal, DecimalException
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
@@ -22,6 +23,17 @@ from nova_transcriber.safe_logging import configure_logging
 
 
 FILE_ROOT = Path("/var/lib/telegram-bot-api")
+
+
+def _read_max_file_size_mb() -> Decimal:
+    try:
+        value = Decimal(os.environ.get("MAX_FILE_SIZE_MB", "100"))
+        if not value.is_finite() or value <= 0:
+            raise ValueError
+        value * 1_048_576
+    except (DecimalException, ValueError):
+        raise ValueError("MAX_FILE_SIZE_MB должен быть положительным конечным числом (в МиБ)") from None
+    return value
 
 
 async def start(message: Message) -> None:
@@ -113,9 +125,19 @@ async def history_callback(callback: CallbackQuery) -> None:
     )
 
 
-async def receive_file(message: Message, bot: Bot) -> None:
+async def receive_file(
+    message: Message, bot: Bot, max_file_size_mb: Decimal = Decimal("100")
+) -> None:
     source_type = message.content_type
     media = getattr(message, source_type)
+    max_file_size = max_file_size_mb * 1_048_576
+    too_large_message = (
+        f"Файл слишком большой. Максимальный размер — {max_file_size_mb.normalize():f} МБ."
+    )
+    metadata_size = getattr(media, "file_size", None)
+    if isinstance(metadata_size, int) and metadata_size > max_file_size:
+        await message.answer(too_large_message)
+        return
 
     try:
         file = await bot.get_file(media.file_id)
@@ -128,16 +150,16 @@ async def receive_file(message: Message, bot: Bot) -> None:
         if not path.is_relative_to(FILE_ROOT) or not path.is_file():
             raise ValueError("Локальный файл недоступен в общем каталоге")
         filename = getattr(media, "file_name", None) or path.name
-        file_size = media.file_size
-        if file_size is None:
-            file_size = file.file_size
-        if file_size is None:
-            file_size = path.stat().st_size
+        file_size = path.stat().st_size
     except (TelegramAPIError, OSError, ValueError):
         await message.answer(
             "Не удалось получить доступ к файлу. Проверьте локальный Bot API "
             "и подключение общего каталога файлов."
         )
+        return
+
+    if file_size > max_file_size:
+        await message.answer(too_large_message)
         return
 
     await message.answer("Файл получен. Начинаю обработку; файлы обрабатываются по одному.")
@@ -171,6 +193,7 @@ async def receive_file(message: Message, bot: Bot) -> None:
 
 async def main() -> None:
     configure_logging()
+    max_file_size_mb = _read_max_file_size_mb()
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     allowed_user_id = int(os.environ["TELEGRAM_ALLOWED_USER_ID"])
     if allowed_user_id <= 0:
@@ -179,6 +202,7 @@ async def main() -> None:
     await asyncio.to_thread(database.init_db)
 
     dispatcher = Dispatcher()
+    dispatcher["max_file_size_mb"] = max_file_size_mb
     dispatcher.message.filter(F.from_user.id == allowed_user_id)
     dispatcher.callback_query.filter(F.from_user.id == allowed_user_id)
     dispatcher.message.register(start, CommandStart())

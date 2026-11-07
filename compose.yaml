@@ -30,6 +30,8 @@ services:
 
   postgres:
     image: postgres:16-bookworm
+    ports:
+      - "127.0.0.1:5433:5432"
     environment:
       POSTGRES_DB: ${POSTGRES_DB:?Укажите POSTGRES_DB в .env}
       POSTGRES_USER: ${POSTGRES_USER:?Укажите POSTGRES_USER в .env}

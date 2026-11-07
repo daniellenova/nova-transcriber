@@ -1,0 +1,6 @@
+services:
+  transcriber:
+    build: .
+    volumes:
+      - ./data:/data
+      - ./models:/app/models:ro

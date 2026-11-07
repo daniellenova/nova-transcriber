@@ -17,6 +17,8 @@ from aiogram.types import (
 )
 
 from nova_transcriber import core, database
+from nova_transcriber.errors import MediaError
+from nova_transcriber.safe_logging import configure_logging
 
 
 FILE_ROOT = Path("/var/lib/telegram-bot-api")
@@ -147,6 +149,9 @@ async def receive_file(message: Message, bot: Bot) -> None:
             file_size=file_size,
             duration=getattr(media, "duration", None),
         )
+    except MediaError as error:
+        await message.answer(str(error))
+        return
     except Exception:
         logging.getLogger(__name__).exception("Ошибка обработки файла")
         await message.answer("Не удалось обработать файл. Попробуйте повторить позже.")
@@ -165,6 +170,7 @@ async def receive_file(message: Message, bot: Bot) -> None:
 
 
 async def main() -> None:
+    configure_logging()
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     allowed_user_id = int(os.environ["TELEGRAM_ALLOWED_USER_ID"])
     if allowed_user_id <= 0:

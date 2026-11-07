@@ -3,6 +3,10 @@ from pathlib import Path
 from collections.abc import Callable
 
 from faster_whisper import WhisperModel
+from faster_whisper.audio import decode_audio
+from av.error import FFmpegError
+
+from nova_transcriber.errors import EmptyFileError, UnreadableMediaError
 
 
 @cache
@@ -19,6 +23,16 @@ def transcribe(path: str | Path, *, on_status: Callable[[str], None] | None = No
     path = Path(path)
     if not path.is_file():
         raise FileNotFoundError(f"Аудиофайл не найден: {path}")
+    if path.stat().st_size == 0:
+        raise EmptyFileError()
+
+    with path.open("rb") as source:
+        try:
+            audio = decode_audio(source, sampling_rate=16000)
+        except (FFmpegError, ValueError, EOFError, IndexError) as error:
+            raise UnreadableMediaError() from error
+    if audio.size == 0:
+        raise UnreadableMediaError()
 
     if on_status is not None:
         on_status("Загрузка модели…")
@@ -27,7 +41,7 @@ def transcribe(path: str | Path, *, on_status: Callable[[str], None] | None = No
         on_status("Распознавание…")
 
     segments, _ = model.transcribe(
-        str(path),
+        audio,
         language="ru",
         task="transcribe",
         vad_filter=False,

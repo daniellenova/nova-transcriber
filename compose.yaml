@@ -1,6 +1,26 @@
 services:
   transcriber:
     build: .
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: ${POSTGRES_DB:?Укажите POSTGRES_DB в .env}
+      PGUSER: ${POSTGRES_USER:?Укажите POSTGRES_USER в .env}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Укажите POSTGRES_PASSWORD в .env}
     volumes:
       - ./data:/data
       - ./models:/app/models:ro
+
+  postgres:
+    image: postgres:16-bookworm
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?Укажите POSTGRES_DB в .env}
+      POSTGRES_USER: ${POSTGRES_USER:?Укажите POSTGRES_USER в .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Укажите POSTGRES_PASSWORD в .env}
+    ports:
+      - "127.0.0.1:${PGPORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:

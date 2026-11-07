@@ -49,3 +49,18 @@ docker compose run --build --rm transcriber "/data/Запись.m4a"
 ```
 
 TXT появится в `./data`; кэш весов модели хранится в `./models` и сохраняется при пересоздании контейнера. Python и faster-whisper в Windows устанавливать не требуется.
+
+## Telegram
+
+Скопируйте `.env.example` в `.env`, задайте пароль PostgreSQL, `TELEGRAM_BOT_TOKEN` от @BotFather, свой числовой `TELEGRAM_ALLOWED_USER_ID`, а также `TELEGRAM_API_ID` и `TELEGRAM_API_HASH` с [my.telegram.org](https://my.telegram.org/apps).
+
+Если бот уже работал через облачный Bot API, остановите прежний процесс и один раз вызовите метод `logOut` на облачном сервере перед переходом на локальный. При активном webhook сначала удалите его методом `deleteWebhook`. См. [инструкцию Telegram](https://core.telegram.org/bots/api#using-a-local-bot-api-server).
+
+Из корня проекта выполните:
+
+```sh
+docker compose up -d telegram-bot-api
+docker compose run --build --rm --entrypoint /app/.venv/bin/python transcriber -m nova_transcriber.telegram
+```
+
+Отправьте боту `/start`, затем voice, audio, video или document. Сейчас он только подтверждает получение файла; ASR и БД не подключены. Используется polling через локальный Bot API без публикации его порта; файлы доступны обоим контейнерам в `/var/lib/telegram-bot-api` через постоянный volume `telegram_data`.

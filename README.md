@@ -45,7 +45,7 @@ Nova Transcriber — локальный сервис автоматическо�
 Положите аудиофайл в `./data` и из корня проекта выполните (требуется Docker Compose):
 
 ```sh
-docker compose run --build --rm transcriber "/data/Запись.m4a"
+docker compose run --build --rm --no-deps --entrypoint /app/.venv/bin/nova-transcriber transcriber "/data/Запись.m4a"
 ```
 
 TXT появится в `./data`; кэш весов модели хранится в `./models` и сохраняется при пересоздании контейнера. Python и faster-whisper в Windows устанавливать не требуется.
@@ -59,8 +59,7 @@ TXT появится в `./data`; кэш весов модели хранитс�
 Из корня проекта выполните:
 
 ```sh
-docker compose up -d telegram-bot-api
-docker compose run --build --rm --entrypoint /app/.venv/bin/python transcriber -m nova_transcriber.telegram
+docker compose up -d --build
 ```
 
-Отправьте боту `/start`, затем voice, audio, video или document. Сейчас он только подтверждает получение файла; ASR и БД не подключены. Используется polling через локальный Bot API без публикации его порта; файлы доступны обоим контейнерам в `/var/lib/telegram-bot-api` через постоянный volume `telegram_data`.
+Команда запускает Telegram-бота, локальный Bot API и PostgreSQL. Если зависимости ещё не готовы, завершившийся с ошибкой бот перезапускается. PostgreSQL доступен приложению только внутри Docker по адресу `postgres:5432`, порт на хост не публикуется. Модель faster-whisper Large-v3 должна находиться в `./models/large-v3`. Отправьте боту `/start`, затем voice, audio, video или document: он распознает русскую речь и вернёт TXT в UTF-8. Текст и метаданные сохраняются в PostgreSQL, таблицы создаются при запуске бота. Файлы обрабатываются по одному; `/history` пока не реализована. Используется polling через локальный Bot API без публикации его порта; исходные файлы читаются из общего volume `telegram_data` без дополнительных копий.

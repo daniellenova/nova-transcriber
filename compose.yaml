@@ -1,6 +1,11 @@
 services:
   transcriber:
     build: .
+    entrypoint: ["/app/.venv/bin/python", "-m", "nova_transcriber.telegram"]
+    restart: on-failure
+    depends_on:
+      - postgres
+      - telegram-bot-api
     environment:
       PGHOST: postgres
       PGPORT: "5432"
@@ -29,8 +34,6 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:?Укажите POSTGRES_DB в .env}
       POSTGRES_USER: ${POSTGRES_USER:?Укажите POSTGRES_USER в .env}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Укажите POSTGRES_PASSWORD в .env}
-    ports:
-      - "127.0.0.1:${PGPORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
 

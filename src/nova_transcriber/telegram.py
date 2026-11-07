@@ -7,8 +7,14 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.exceptions import TelegramAPIError
-from aiogram.filters import CommandStart
-from aiogram.types import BufferedInputFile, Message
+from aiogram.filters import Command, CommandStart
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from nova_transcriber import core, database
 
@@ -20,6 +26,88 @@ async def start(message: Message) -> None:
     await message.answer(
         "Отправьте голосовое сообщение, аудио, видео или документ. "
         "После распознавания русской речи вы получите TXT."
+        " История результатов: /history."
+    )
+
+
+def _recording_summary(record: dict) -> str:
+    created_at = record["created_at"].strftime("%d.%m.%Y %H:%M:%S %z")
+    summary = f"Файл: {record['filename'][:1024]}\nДата: {created_at}"
+    if record["duration"] is not None:
+        summary += f"\nДлительность: {record['duration']:g} с"
+    return summary
+
+
+async def history(message: Message) -> None:
+    try:
+        records = await asyncio.to_thread(database.get_recent_transcriptions, 10)
+    except Exception:
+        logging.getLogger(__name__).exception("Не удалось получить историю")
+        await message.answer("Не удалось загрузить историю. Попробуйте позже.")
+        return
+
+    successful = [record for record in records if record["status"] == "done"]
+    if not successful:
+        await message.answer("Среди последних 10 транскрибаций нет готовых результатов.")
+        return
+
+    for record in successful:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="Скачать TXT", callback_data=f"history:txt:{record['id']}"
+            ),
+            InlineKeyboardButton(
+                text="Информация", callback_data=f"history:info:{record['id']}"
+            ),
+        ]])
+        await message.answer(_recording_summary(record), reply_markup=keyboard)
+
+
+async def history_callback(callback: CallbackQuery) -> None:
+    parts = (callback.data or "").split(":")
+    if (
+        len(parts) != 3
+        or parts[1] not in {"txt", "info"}
+        or not parts[2].isascii()
+        or not parts[2].isdigit()
+        or not 0 < int(parts[2]) <= 9223372036854775807
+    ):
+        await callback.answer("Некорректный идентификатор.", show_alert=True)
+        return
+    if not isinstance(callback.message, Message):
+        await callback.answer("Сообщение недоступно.", show_alert=True)
+        return
+
+    await callback.answer()
+    try:
+        record = await asyncio.to_thread(database.get_transcription, int(parts[2]))
+    except Exception:
+        logging.getLogger(__name__).exception("Не удалось получить транскрибацию")
+        await callback.message.answer("Не удалось загрузить результат. Попробуйте позже.")
+        return
+    if record is None or record["status"] != "done" or record["text"] is None:
+        await callback.message.answer("Готовый результат не найден.")
+        return
+
+    if parts[1] == "txt":
+        output_name = Path(record["filename"].replace("\\", "/")).stem + ".txt"
+        try:
+            await callback.message.answer_document(
+                BufferedInputFile(record["text"].encode("utf-8"), filename=output_name)
+            )
+        except TelegramAPIError:
+            await callback.message.answer("Не удалось отправить TXT. Попробуйте позже.")
+        return
+
+    processing_time = record["processing_time"]
+    processing = f"{processing_time:g} с" if processing_time is not None else "неизвестно"
+    summary = _recording_summary(record)
+    if record["duration"] is None:
+        summary += "\nДлительность: неизвестна"
+    await callback.message.answer(
+        f"{summary}\nРазмер: {record['file_size']} байт\n"
+        f"Модель: {record['model']}\nВремя обработки: {processing}\n"
+        f"Символов: {len(record['text'])}"
     )
 
 
@@ -86,7 +174,10 @@ async def main() -> None:
 
     dispatcher = Dispatcher()
     dispatcher.message.filter(F.from_user.id == allowed_user_id)
+    dispatcher.callback_query.filter(F.from_user.id == allowed_user_id)
     dispatcher.message.register(start, CommandStart())
+    dispatcher.message.register(history, Command("history"))
+    dispatcher.callback_query.register(history_callback, F.data.startswith("history:"))
     dispatcher.message.register(
         receive_file, F.content_type.in_({"voice", "audio", "video", "document"})
     )
@@ -95,7 +186,7 @@ async def main() -> None:
         api=TelegramAPIServer.from_base("http://telegram-bot-api:8081", is_local=True)
     )
     async with Bot(token=token, session=session) as bot:
-        await dispatcher.start_polling(bot, allowed_updates=["message"])
+        await dispatcher.start_polling(bot, allowed_updates=["message", "callback_query"])
 
 
 if __name__ == "__main__":

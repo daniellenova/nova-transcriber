@@ -180,10 +180,5 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
-/data/*
-!/data/.gitkeep
-!/data/telegram/
-/data/telegram/*
-!/data/telegram/.gitkeep
 /models/*
 !/models/.gitkeep

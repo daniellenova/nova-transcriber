@@ -8,7 +8,7 @@ from psycopg.rows import dict_row
 
 _TASK_COLUMNS = """t.id, t.model, t.status, t.processing_time, t.created_at,
     t.started_at, t.finished_at, t.error_reason, t.telegram_chat_id, t.telegram_message_id,
-    t.processed_samples, t.total_samples, t.stage, t.file_key, t.delete_requested, t.number,
+    t.processed_samples, t.progress_samples, t.total_samples, t.stage, t.file_key, t.delete_requested, t.number, t.delivery_state,
     r.filename, r.source_type, r.file_size, r.duration"""
 
 
@@ -67,12 +67,20 @@ def init_db() -> None:
                 ADD COLUMN IF NOT EXISTS telegram_chat_id BIGINT,
                 ADD COLUMN IF NOT EXISTS telegram_message_id BIGINT,
                 ADD COLUMN IF NOT EXISTS processed_samples BIGINT NOT NULL DEFAULT 0,
+                ADD COLUMN IF NOT EXISTS progress_samples BIGINT NOT NULL DEFAULT 0,
                 ADD COLUMN IF NOT EXISTS total_samples BIGINT,
                 ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0,
                 ADD COLUMN IF NOT EXISTS stage TEXT,
                 ADD COLUMN IF NOT EXISTS delete_requested BOOLEAN NOT NULL DEFAULT FALSE,
-                ADD COLUMN IF NOT EXISTS number BIGINT
+                ADD COLUMN IF NOT EXISTS number BIGINT,
+                ADD COLUMN IF NOT EXISTS delivery_state TEXT
         """)
+        connection.execute("""UPDATE transcriptions SET delivery_state = CASE
+            WHEN status = 'completed' AND delivery_notified THEN 'sent' ELSE 'pending' END
+            WHERE delivery_state IS NULL""")
+        connection.execute("""ALTER TABLE transcriptions
+            ALTER COLUMN delivery_state SET DEFAULT 'pending',
+            ALTER COLUMN delivery_state SET NOT NULL""")
         connection.execute('DROP INDEX IF EXISTS transcriptions_user_number')
         connection.execute('DROP TABLE IF EXISTS transcription_counters')
         _renumber(connection)
@@ -175,7 +183,8 @@ def claim_task(connection):
                             error=INTERRUPTED_REASON).warning("Продолжение с сохранённого фрагмента")
             connection.execute("""
                 UPDATE transcriptions SET status = 'processing',
-                    started_at = COALESCE(started_at, clock_timestamp()), stage = 'Подготовка аудио'
+                    started_at = COALESCE(started_at, clock_timestamp()), stage = 'Подготовка аудио',
+                    progress_samples = processed_samples
                 WHERE id = %s
             """, (row['id'],))
             return row
@@ -193,6 +202,12 @@ def set_audio_duration(connection, identifier, total_samples):
         return True
 
 
+def update_progress(connection, identifier, samples):
+    connection.execute("""UPDATE transcriptions SET progress_samples =
+        LEAST(total_samples, GREATEST(processed_samples, progress_samples, %s))
+        WHERE id = %s AND status = 'processing'""", (samples, identifier))
+
+
 def save_chunk(connection, identifier, start_sample, end_sample, text, processing_time):
     with connection.transaction():
         if connection.execute('SELECT status FROM transcriptions WHERE id = %s FOR UPDATE', (identifier,)).fetchone()['status'] != 'processing':
@@ -200,9 +215,9 @@ def save_chunk(connection, identifier, start_sample, end_sample, text, processin
         connection.execute("""INSERT INTO transcription_chunks
             (transcription_id, start_sample, end_sample, text) VALUES (%s, %s, %s, %s)""",
             (identifier, start_sample, end_sample, text))
-        connection.execute("""UPDATE transcriptions SET processed_samples = %s,
+        connection.execute("""UPDATE transcriptions SET processed_samples = %s, progress_samples = %s,
             processing_time = %s, retry_count = 0 WHERE id = %s AND status = 'processing'""",
-            (end_sample, processing_time, identifier))
+            (end_sample, end_sample, processing_time, identifier))
         return True
 
 
@@ -238,20 +253,23 @@ def change_task(identifier, user_id, action):
             if row['status'] == 'paused':
                 return
             if row['status'] not in {'pending', 'processing'}:
-                raise ValueError('Задача уже завершена. Обновите карточку')
+                raise ValueError('Запись уже завершена')
             connection.execute("""UPDATE transcriptions SET status = 'paused', stage = NULL,
                 delivery_notified = FALSE WHERE id = %s""", (identifier,))
             return
         expected = 'failed' if action == 'retry' else 'paused'
+        if row['status'] in {'pending', 'processing'}:
+            return
         if row['status'] != expected:
-            raise ValueError('Состояние задачи изменилось. Обновите карточку')
+            raise ValueError('Состояние записи изменилось. Это действие уже недоступно')
         if not row['file_key']:
             raise ValueError('Исходный файл недоступен. Отправьте запись заново')
         acquired = connection.execute('SELECT pg_try_advisory_xact_lock(%s) AS acquired', (-identifier,)).fetchone()['acquired']
         if not acquired:
             raise ValueError('Обработчик ещё останавливается. Повторите через несколько секунд')
         connection.execute("""UPDATE transcriptions SET status = 'pending', retry_count = 0,
-            error_reason = NULL, finished_at = NULL, stage = NULL, delivery_notified = FALSE
+            error_reason = NULL, finished_at = NULL, stage = NULL, delivery_notified = FALSE,
+            delivery_state = 'pending'
             WHERE id = %s""", (identifier,))
 
 
@@ -349,6 +367,26 @@ def notifications(user_id):
 def acknowledge(identifier, user_id):
     with _connect() as connection:
         connection.execute("UPDATE transcriptions SET delivery_notified=TRUE WHERE id=%s AND user_id=%s AND status IN ('completed','failed','paused')", (identifier, user_id))
+
+
+def delivery(identifier, user_id, action, manual=False):
+    with _connect() as connection:
+        row = connection.execute('SELECT status, delivery_state, delete_requested FROM transcriptions WHERE id = %s AND user_id = %s FOR UPDATE',
+                                 (identifier, user_id)).fetchone()
+        if row is None or row['status'] != 'completed' or row['delete_requested']:
+            raise ValueError('Готовый результат недоступен')
+        if action == 'start':
+            if row['delivery_state'] == 'sent' or (not manual and row['delivery_state'] != 'pending'):
+                return False
+            state = 'sending'
+        elif action in {'sent', 'failed'}:
+            if row['delivery_state'] != 'sending':
+                return False
+            state = action
+        else:
+            raise ValueError('Недопустимое действие')
+        connection.execute('UPDATE transcriptions SET delivery_state = %s, delivery_notified = FALSE WHERE id = %s', (state, identifier))
+        return True
 
 
 def complete_transcription(

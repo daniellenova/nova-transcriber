@@ -24,7 +24,6 @@ services:
       MAX_DURATION_SECONDS: ${MAX_DURATION_SECONDS-43200}
       DISPLAY_TIMEZONE: ${DISPLAY_TIMEZONE:-Europe/Moscow}
     volumes:
-      - ./data:/media:ro
       - telegram_data:/media/telegram:ro
 
   whisper-worker:
@@ -45,7 +44,6 @@ services:
       STAGE_TIMEOUT_SECONDS: ${STAGE_TIMEOUT_SECONDS-3600}
       DISPLAY_TIMEZONE: ${DISPLAY_TIMEZONE:-Europe/Moscow}
     volumes:
-      - ./data:/media:ro
       - telegram_data:/media/telegram:ro
       - ./models:/app/models:ro
 

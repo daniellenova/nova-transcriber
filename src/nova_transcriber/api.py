@@ -43,6 +43,17 @@ class Handler(BaseHTTPRequestHandler):
             user_id = get_owner_id()
             url = urlsplit(self.path)
             parts = url.path.strip("/").split("/")
+            if self.command == 'POST' and len(parts) == 3 and parts[0] == 'tasks' and parts[2] == 'delivery':
+                identifier = int(parts[1])
+                length = int(self.headers.get('Content-Length', '0'))
+                if not 0 < identifier <= 9223372036854775807 or not 0 < length <= 1024 or self.headers.get('Transfer-Encoding'):
+                    raise ValueError('Некорректные данные доставки')
+                data = json.loads(self.rfile.read(length))
+                if not isinstance(data, dict) or type(data.get('manual', False)) is not bool:
+                    raise ValueError('Некорректные данные доставки')
+                acquired = database.delivery(identifier, user_id, data.get('action'), data.get('manual', False))
+                self.respond(200, {'ok': acquired})
+                return
             if self.command == 'POST' and parts == ['tasks', 'delete']:
                 if self.headers.get('Transfer-Encoding'):
                     raise ValueError('Неподдерживаемый способ передачи')

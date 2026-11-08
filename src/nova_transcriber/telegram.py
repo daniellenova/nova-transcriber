@@ -1,12 +1,10 @@
 import asyncio
 import logging
 import os
-import math
 import re
 import signal
 import secrets
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+from html import escape
 from decimal import Decimal
 from pathlib import Path
 from time import perf_counter
@@ -17,11 +15,13 @@ from loguru import logger
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.default import DefaultBotProperties
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter, TelegramServerError
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     BufferedInputFile,
+    BotCommand,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -38,13 +38,18 @@ FILE_ROOT = Path("/var/lib/telegram-bot-api")
 DOWNLOAD_LOCK = asyncio.Lock()
 HISTORY_LOCK = asyncio.Lock()
 HISTORY_PANEL = {}
+SEND_BUSY = set()
+CONFIRMED_SENDS = set()
+CALLBACK_BUSY = set()
+CALLBACK_LAST = {}
 
 
 async def start(message: Message) -> None:
     await message.answer(
-        "Отправьте голосовое сообщение, аудио, видео или документ. "
-        "После распознавания русской речи вы получите TXT."
-        " История результатов: /history."
+        '<b>🎙️ Nova Transcriber</b>\n\nОтправьте аудио — я превращу речь в текст.',
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text='📂 История', callback_data='history:page:0'),
+        ]]),
     )
 
 
@@ -61,21 +66,27 @@ def _duration(value: float) -> str:
     return " ".join(parts)
 
 
-def _progress(record: dict) -> str:
+def _clock(value):
+    hours, seconds = divmod(round(value), 3600)
+    minutes, seconds = divmod(seconds, 60)
+    return f'{hours}:{minutes:02}:{seconds:02}' if hours else f'{minutes}:{seconds:02}'
+
+
+def _progress(record: dict, *, saved=False, bar=False, compact=False) -> str:
     total = record.get('total_samples')
     if not total:
-        return record.get('stage') or 'Подготовка аудио'
+        return 'Подготавливаю'
     processed = record.get('processed_samples', 0)
-    percent = min(100, processed * 100 // total)
-    return f'{percent}% · {_duration(processed / 16000)} из {_duration(total / 16000)}'
-
-
-def _partial_keyboard(record):
-    if not record.get('has_partial_result'):
-        return None
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text='Скачать неполный TXT', callback_data=f"history:txt:{record['id']}"),
-    ]])
+    if not saved and record['status'] == 'processing':
+        processed = max(processed, record.get('progress_samples', 0))
+    processed = min(processed, total)
+    percent = min(99.9 if not saved and record['status'] == 'processing' else 100, processed * 100 / total)
+    text = f'{percent:.1f}% · {_duration(processed / 16000)} из {_duration(total / 16000)}'
+    if compact:
+        filled = int(percent / 10)
+        meter = '█' * filled + '░' * (10 - filled) + ' ' if bar else ''
+        text = f'{meter}<b>{percent:.1f}%</b>\n\n⏱ Обработано: {_clock(processed / 16000)} из {_clock(total / 16000)}'
+    return text
 
 
 def _recording_name(record: dict) -> str:
@@ -92,81 +103,67 @@ def _recording_name(record: dict) -> str:
     filename = " ".join(filename.split())
     if len(filename) > 200:
         filename = filename[:199] + "…"
-    return filename
+    # Разрываем автоматическое распознавание ссылок в отображаемом имени.
+    return escape(filename.translate(str.maketrans({symbol: symbol + '\u200b' for symbol in '.:@'})))
 
 
-def _recording_summary(record: dict) -> str:
-    filename = _recording_name(record)
-    created_at = record.get("created_at")
-    date = "Дата неизвестна"
-    if isinstance(created_at, str):
-        created_at = datetime.fromisoformat(created_at)
-    if created_at is not None:
-        if created_at.tzinfo is None:
-            created_at = created_at.replace(tzinfo=timezone.utc)
-        date = created_at.astimezone(
-            ZoneInfo(os.environ.get("DISPLAY_TIMEZONE", "Europe/Moscow"))
-        ).strftime("%d.%m.%Y, %H:%M")
-    lines = [f"Запись №{record['number']}", f"Файл: {filename}", f"Дата: {date}"]
-    for key, label in (("duration", "Длительность записи"),
-                       ("processing_time", "Время обработки")):
-        value = record.get(key)
-        if value is not None and math.isfinite(value) and value >= 0:
-            lines.append(f"{label}: {_duration(value)}")
-    statuses = {
-        "pending": "Ожидает обработки", "processing": "Обрабатывается",
-        "completed": "Завершена",
-        "failed": "Ошибка",
-        "paused": "Приостановлена",
-    }
-    state = 'Удаляется' if record.get('deleting') else statuses.get(record.get('status'), 'Неизвестно')
-    lines.append(f"Состояние: {state}")
-    if record.get('status') in {'pending', 'processing', 'failed', 'paused'} and record.get('total_samples'):
-        lines.append(f"Обработано: {_progress(record)}")
-    if record.get("status") == "failed" and record.get("error_reason"):
-        reason = record["error_reason"].rstrip(".")
-        safe_reasons = {
-            "Файл пустой", "Неподдерживаемый формат файла",
-            "Не удалось прочитать аудио или видео", "Не удалось обработать файл",
-            "Не удалось обработать аудио или видео",
-            "Не удалось прочитать аудио или видео. Проверьте файл",
-            "Ошибка распознавания аудио или видео",
-            "Обработка отменена до начала распознавания",
-            "Обработка прервана до начала распознавания",
-            "Обработка прервана из-за остановки или перезапуска сервиса",
-            "Запись превышает допустимую длительность",
-            "Файл превышает допустимый размер",
-            "Недостаточно свободного места на диске",
-            "Превышено число попыток восстановления",
-            "Исходный файл недоступен",
-            "Длительность исходного файла изменилась",
-            "Процесс обработки неожиданно остановился",
-        }
-        safe_reasons.update(f'Превышено время этапа «{stage}»' for stage in (
-            'Подготовка аудио', 'Определение длительности', 'Загрузка модели',
-            'Чтение аудио', 'Распознавание',
-        ))
-        reasons = {
-            "Не удалось сохранить результат в PostgreSQL": "Не удалось сохранить результат",
-            "Не удалось начать обработку в PostgreSQL": "Не удалось начать обработку",
-        }
-        reason = reasons.get(reason, reason if reason in safe_reasons else "Не удалось обработать файл")
-        lines.append(f"Причина: {reason}.")
-    return "\n".join(lines)
+def _status(record):
+    if record.get('deleting'):
+        return '🗑️ Удаляется'
+    if record['status'] == 'processing':
+        return '🎙️ Распознаю речь' if record.get('stage') == 'Распознавание' else '⚙️ Подготавливаю'
+    return {'pending': '⏳ В очереди', 'completed': '✅ Готово',
+            'failed': '⚠️ Не удалось обработать', 'paused': '🚫 Обработка отменена'}[record['status']]
+
+
+def _recording_summary(record, *, progress_bar=False):
+    title = _status(record)
+    if record['status'] == 'completed' and record['delivery_state'] in {'failed', 'sending'} and record['id'] not in SEND_BUSY:
+        title = '⚠️ Не удалось отправить TXT'
+    lines = [f"<b>{title} · №{record['number']}</b>", '', _recording_name(record), '']
+    if record['status'] in {'pending', 'processing', 'paused', 'failed'} and record.get('total_samples'):
+        lines.append(_progress(record, bar=progress_bar, compact=True))
+    elif record.get('duration') is not None:
+        lines.append(f"⏱ Длительность: {_duration(record['duration'])}")
+    if record['status'] == 'processing' and record.get('stage') != 'Распознавание':
+        lines.append('\nПроверяю аудио перед распознаванием…')
+    if record['status'] == 'completed':
+        if record['delivery_state'] == 'sent':
+            lines.append('\n📄 TXT отправлен и доступен в истории.')
+        elif record['id'] in SEND_BUSY or record['delivery_state'] == 'pending':
+            lines.append('\nTXT готов. Отправляю…')
+        else:
+            lines.append('\nРасшифровка сохранена. Попробуйте отправить TXT ещё раз.')
+    elif record['status'] == 'failed':
+        lines.append('\nВозникла ошибка при распознавании. Попробуйте ещё раз.')
+    return '\n'.join(lines)
+
+
+def _task_keyboard(record, *, history=True):
+    rows = []
+    identifier = record['id']
+    if not record.get('deleting'):
+        if record['status'] == 'completed':
+            label = '📄 Скачать TXT' if record['delivery_state'] == 'sent' else '📄 Отправить TXT'
+            rows.append([InlineKeyboardButton(text=label, callback_data=f'history:txt:{identifier}')])
+        elif record.get('has_partial_result'):
+            rows.append([InlineKeyboardButton(text='📄 Скачать неполный TXT', callback_data=f'history:txt:{identifier}')])
+        names = {'cancel': '✖️ Отменить', 'resume': '▶️ Продолжить', 'retry': '🔄 Повторить'}
+        for action in record['actions']:
+            rows.append([InlineKeyboardButton(text=names[action], callback_data=f'history:{action}:{identifier}')])
+    if history:
+        rows.append([InlineKeyboardButton(text='📂 История', callback_data='history:show:0')])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _history_label(record):
-    status = {
-        'completed': '✅ Готово', 'pending': '⏳ В очереди',
-        'processing': '⏳ Распознаётся', 'paused': '⏸ Приостановлена',
-        'failed': '⚠️ Ошибка',
-    }[record['status']]
+    status = _status(record)
+    if record['status'] == 'failed' and not record.get('deleting'):
+        status = '⚠️ Ошибка'
     if record['status'] == 'processing' and record.get('total_samples'):
-        status += f" · {min(100, record['processed_samples'] * 100 // record['total_samples'])}%"
-    if record.get('deleting'):
-        status = '🗑 Удаляется'
+        status = '🎙️ ' + _progress(record).split(' · ', 1)[0]
     duration = _duration(record['duration']) if record.get('duration') is not None else 'длительность уточняется'
-    return f"№{record['number']}. {_recording_name(record)}\n{status} · {duration}"
+    return f"<b>№{record['number']}</b> · {status} · {duration}\n{_recording_name(record)}"
 
 
 async def _show_history(message=None, page=0, identifier=None, *, new=False, delete_start=False, delete_event=None):
@@ -230,74 +227,64 @@ async def _show_history(message=None, page=0, identifier=None, *, new=False, del
         rows = []
         if deletion is not None and deletion['mode'] == 'confirm':
             token = deletion['token']
-            title = '🗑 Удалить запись?' if len(deletion['selected']) == 1 else f"🗑 Удалить выбранные записи ({len(deletion['selected'])})?"
-            text = (f'{title}\n\n'
-                    'Записи исчезнут из истории.\nСохранённые тексты и промежуточные части будут удалены.\n\n'
-                    'Исходные аудиофайлы не удаляются. Уже отправленные сообщения и TXT останутся в Telegram.\n\n'
-                    'Активные задачи сначала будут остановлены.\nЭто действие нельзя отменить.')
-            rows.append([InlineKeyboardButton(text='🗑 Да, удалить', callback_data=f'delete:{token}:commit:0'),
+            title = '🗑️ Удалить запись?' if len(deletion['selected']) == 1 else f"🗑️ Удалить выбранные записи ({len(deletion['selected'])})?"
+            text = (f'<b>{title}</b>\n\n'
+                    'Из истории будут удалены записи, их тексты и сохранённые части распознавания.\n\n'
+                    'Исходные аудиофайлы и ранее отправленные TXT останутся.\n\n'
+                    '⏳ Активная обработка будет остановлена перед удалением.\n\n<b>Это действие нельзя отменить.</b>')
+            rows.append([InlineKeyboardButton(text='🗑️ Да, удалить', callback_data=f'delete:{token}:commit:0'),
                          InlineKeyboardButton(text='Отмена', callback_data=f'delete:{token}:cancel:0')])
         elif identifier is None or deletion is not None:
             result = await asyncio.to_thread(api_client.request, f'/history?page={page}')
             page = result['page']
-            text = f"История транскрибаций\nЗаписей: {result['total']} · Выберите нужную"
+            text = f"<b>📂 История</b>\n\nВсего записей: <b>{result['total']}</b>"
             if not result['total']:
-                text = 'История транскрибаций пока пуста'
+                text = '<b>📂 История</b>\n\nЗдесь пока нет записей.\nОтправьте аудио, чтобы создать первую расшифровку.'
             if deletion is not None:
                 token = deletion['token']
                 available = [r for r in result['items'] if not r.get('deleting')]
                 deletion['allowed'] = {r['id'] for r in available}
-                text = f"🗑 Выберите записи для удаления\nВыбрано: {len(deletion['selected'])}"
+                text = f"<b>🗑️ Удаление записей</b>\n\nВыбрано: <b>{len(deletion['selected'])}</b>"
                 text += '\n\n' + '\n\n'.join(
-                    f"{'☑' if r['id'] in deletion['selected'] else '☐'} {_history_label(r)}" for r in result['items'])
+                    f"{'☑️' if r['id'] in deletion['selected'] else '☐'} <b>№{r['number']}</b> · {_recording_name(r)}" for r in result['items'])
                 if available:
                     rows.append([InlineKeyboardButton(
-                        text=f"{'☑ ' if r['id'] in deletion['selected'] else ''}{r['number']}",
+                        text=f"{'☑️ ' if r['id'] in deletion['selected'] else ''}№{r['number']}",
                         callback_data=f"delete:{token}:toggle:{r['id']}") for r in available])
             elif result['items']:
                 text += '\n\n' + '\n\n'.join(_history_label(record) for record in result['items'])
-                rows.append([InlineKeyboardButton(text=str(record['number']),
+                rows.append([InlineKeyboardButton(text=f"№{record['number']}",
                     callback_data=f"history:open:{record['id']}:{page}") for record in result['items']])
             navigation = []
             if page:
-                navigation.append(InlineKeyboardButton(text='Назад', callback_data=(
+                navigation.append(InlineKeyboardButton(text='◀️ Назад', callback_data=(
                     f'delete:{token}:page:{page - 1}' if deletion is not None else f'history:page:{page - 1}')))
             navigation.append(InlineKeyboardButton(text=f"{page + 1} / {result['pages']}", callback_data='history:noop:0'))
             if page + 1 < result['pages']:
-                navigation.append(InlineKeyboardButton(text='Далее', callback_data=(
+                navigation.append(InlineKeyboardButton(text='Далее ▶️', callback_data=(
                     f'delete:{token}:page:{page + 1}' if deletion is not None else f'history:page:{page + 1}')))
             rows.append(navigation)
             if deletion is not None:
                 if deletion['selected']:
-                    rows.append([InlineKeyboardButton(text=f"🗑 Удалить выбранные ({len(deletion['selected'])})",
+                    rows.append([InlineKeyboardButton(text=f"🗑️ Удалить выбранные ({len(deletion['selected'])})",
                         callback_data=f'delete:{token}:confirm:0')])
-                rows.append([InlineKeyboardButton(text='Отмена', callback_data=f'delete:{token}:cancel:0')])
+                rows.append([InlineKeyboardButton(text='✖️ Отмена', callback_data=f'delete:{token}:cancel:0')])
             elif result['total']:
-                rows.append([InlineKeyboardButton(text='🗑 Удалить записи', callback_data=f'history:delete:0:{page}')])
+                rows.append([InlineKeyboardButton(text='🗑️ Выбрать для удаления', callback_data=f'history:delete:0:{page}')])
         else:
             text = _recording_summary(record)
-            if record['status'] == 'completed' or record.get('has_partial_result'):
-                rows.append([InlineKeyboardButton(
-                    text='📄 Скачать TXT' if record['status'] == 'completed' else '📄 Скачать неполный TXT',
-                    callback_data=f'history:txt:{identifier}')])
-            names = {'cancel': 'Отменить', 'resume': 'Продолжить', 'retry': 'Повторить'}
-            for action in record['actions']:
-                rows.append([InlineKeyboardButton(text=names[action], callback_data=f'history:{action}:{identifier}:{page}')])
+            rows.extend(_task_keyboard(record, history=False).inline_keyboard)
             if not record.get('deleting'):
-                rows.append([InlineKeyboardButton(text='🗑 Удалить запись', callback_data=f'history:delete:{identifier}:{page}')])
-            rows.append([InlineKeyboardButton(text='К списку', callback_data=f'history:page:{page}')])
-        updated_at = datetime.now(timezone.utc).astimezone(
-            ZoneInfo(os.environ.get('DISPLAY_TIMEZONE', 'Europe/Moscow'))
-        ).strftime('%d.%m.%Y, %H:%M:%S')
-        text += f'\n\n──────────\nОбновлено: {updated_at}'
+                rows.append([InlineKeyboardButton(text='🗑️ Удалить запись', callback_data=f'history:delete:{identifier}:{page}')])
+            rows.append([InlineKeyboardButton(text='◀️ К истории', callback_data=f'history:page:{page}')])
         keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
         signature = (message.chat.id, message.message_id, text, keyboard.model_dump_json())
         if new:
-            message = await message.answer(text, parse_mode=None, reply_markup=keyboard)
+            message = await message.answer(text, parse_mode='HTML', reply_markup=keyboard)
             signature = (message.chat.id, message.message_id, text, keyboard.model_dump_json())
         elif HISTORY_PANEL.get('signature') != signature:
             try:
-                await message.edit_text(text, parse_mode=None, reply_markup=keyboard)
+                await message.edit_text(text, parse_mode='HTML', reply_markup=keyboard)
             except TelegramAPIError as error:
                 if 'message is not modified' not in error.message.lower():
                     if isinstance(error, TelegramBadRequest):
@@ -341,11 +328,11 @@ async def history_callback(callback: CallbackQuery) -> None:
     parts = (callback.data or "").split(":")
     if (
         len(parts) not in {3, 4}
-        or parts[1] not in {'txt', 'info', 'page', 'open', 'cancel', 'resume', 'retry', 'noop', 'delete'}
+        or parts[1] not in {'txt', 'info', 'page', 'show', 'open', 'cancel', 'resume', 'retry', 'noop', 'delete'}
         or not parts[2].isascii()
         or not parts[2].isdigit()
         or not 0 <= int(parts[2]) <= 9223372036854775807
-        or (parts[1] not in {'page', 'noop', 'delete'} and int(parts[2]) == 0)
+        or (parts[1] not in {'page', 'show', 'noop', 'delete'} and int(parts[2]) == 0)
         or (parts[1] == 'page' and int(parts[2]) > 2147483647)
         or (len(parts) == 4 and (not parts[3].isascii() or not parts[3].isdigit() or not 0 <= int(parts[3]) <= 2147483647))
     ):
@@ -362,6 +349,9 @@ async def history_callback(callback: CallbackQuery) -> None:
     identifier = int(parts[2])
     page = int(parts[3]) if len(parts) == 4 else 0
     try:
+        if action == 'show':
+            await _show_history(callback.message, new=True)
+            return
         if action == 'delete':
             await _show_history(callback.message, page, identifier or None, delete_start=True)
             return
@@ -370,14 +360,23 @@ async def history_callback(callback: CallbackQuery) -> None:
             return
         if action in {'cancel', 'resume', 'retry'}:
             await asyncio.to_thread(api_client.request, f'/tasks/{identifier}/{action}', {})
+            panel_message = HISTORY_PANEL.get('message')
+            if panel_message is not None and (panel_message.chat.id, panel_message.message_id) == (callback.message.chat.id, callback.message.message_id):
+                await _show_history(callback.message, HISTORY_PANEL['page'], identifier)
+            else:
+                record = await asyncio.to_thread(api_client.request, f'/tasks/{identifier}')
+                await callback.message.edit_text(_recording_summary(record, progress_bar=True), reply_markup=_task_keyboard(record), parse_mode='HTML')
+            return
         if action != 'txt':
             await _show_history(callback.message, page, identifier)
             return
-        record = await asyncio.to_thread(api_client.record, identifier)
+        record = await asyncio.to_thread(api_client.request, f'/tasks/{identifier}')
     except ValueError as error:
         await callback.answer(str(error), show_alert=True)
         try:
-            await _show_history(callback.message, page, identifier)
+            panel_message = HISTORY_PANEL.get('message')
+            if panel_message is not None and (panel_message.chat.id, panel_message.message_id) == (callback.message.chat.id, callback.message.message_id):
+                await _show_history(callback.message, page, identifier)
         except Exception:
             logging.getLogger(__name__).exception('Не удалось обновить карточку')
         return
@@ -385,25 +384,15 @@ async def history_callback(callback: CallbackQuery) -> None:
         logging.getLogger(__name__).exception("Не удалось получить транскрибацию")
         await callback.answer('Не удалось загрузить данные. Попробуйте позже.', show_alert=True)
         return
-    if record.get("text") is None:
+    if record['status'] != 'completed' and not record.get('has_partial_result'):
         await callback.answer("Сохранённых частей пока нет.", show_alert=True)
         return
 
-    if parts[1] == "txt":
-        output_name = Path(record["filename"].replace("\\", "/")).stem + ".txt"
-        text = record['text']
-        partial = record.get('partial', False)
-        if partial:
-            output_name = Path(output_name).stem + '_неполный.txt'
-            text = f"Неполный результат\nОбработано: {_progress(record)}\n\n{text}"
-        try:
-            await callback.message.answer_document(
-                BufferedInputFile(text.encode("utf-8"), filename=output_name),
-                caption='Неполный результат' if partial else None,
-            )
-        except TelegramAPIError:
-            await callback.answer("Не удалось отправить TXT. Попробуйте позже.", show_alert=True)
-        return
+    try:
+        await _send_result(callback.bot, callback.message.chat.id, identifier, manual=True)
+    except (TelegramAPIError, ValueError):
+        await callback.answer('Не удалось отправить TXT. Попробуйте ещё раз.', show_alert=True)
+    await _show_history()
 
 
 async def receive_file(
@@ -412,9 +401,16 @@ async def receive_file(
     log = logger.bind(component=f"Telegram, сообщение №{message.message_id}")
     received_at = perf_counter()
     log.bind(event="file_received").info("Получено сообщение с медиафайлом")
+    source_type = message.content_type
+    media = getattr(message, source_type)
+    received_name = _recording_name({'filename': getattr(media, 'file_name', None), 'source_type': source_type})
+    received_text = f'<b>📥 Аудио получено</b>\n\n{received_name}'
+    if getattr(media, 'duration', None) is not None:
+        received_text += f'\n\n⏱ Длительность: {_duration(media.duration)}'
+    received_text += '\n\nДобавляю запись в обработку…'
     try:
         status_message = await message.answer(
-            "Получено сообщение с файлом. Загружаю файл для обработки…"
+            received_text
         )
     except TelegramAPIError as error:
         log.bind(event="file_ack_failed", duration=f"{perf_counter() - received_at:.3f} с",
@@ -423,11 +419,9 @@ async def receive_file(
     log.bind(event="file_ack_sent", duration=f"{perf_counter() - received_at:.3f} с").info(
         "Отправлено подтверждение получения файла"
     )
-    source_type = message.content_type
-    media = getattr(message, source_type)
     max_file_size = max_file_size_mb * 1_048_576
     too_large_message = (
-        f"Файл слишком большой. Максимальный размер — {max_file_size_mb.normalize():f} МБ."
+        f"<b>⚠️ Файл слишком большой</b>\n\nМаксимальный размер: {max_file_size_mb.normalize():f} МБ.\n\nОтправьте файл меньшего размера."
     )
     metadata_size = getattr(media, "file_size", None)
     if isinstance(metadata_size, int) and metadata_size > max_file_size:
@@ -435,7 +429,7 @@ async def receive_file(
         return
     duration = getattr(media, 'duration', None)
     if duration is not None and duration > get_positive_int('MAX_DURATION_SECONDS', 43200):
-        await status_message.edit_text('Запись превышает допустимую длительность.')
+        await status_message.edit_text('<b>⚠️ Не удалось принять файл</b>\n\nЗапись превышает допустимую длительность.')
         return
 
     stage = "Запрос getFile"
@@ -492,8 +486,8 @@ async def receive_file(
         log.bind(event="file_size_read", duration=f"{perf_counter() - stage_started:.3f} с").info(
             "Получен размер локального файла: {} байт", file_size
         )
-    except MediaError as error:
-        await status_message.edit_text(str(error))
+    except MediaError:
+        await status_message.edit_text('<b>⚠️ Не удалось подготовить запись</b>\n\nПопробуйте позже.')
         return
     except TelegramNetworkError as error:
         timed_out = isinstance(error.__cause__, asyncio.TimeoutError)
@@ -502,7 +496,7 @@ async def receive_file(
         log.bind(event="file_download_failed", duration=f"{perf_counter() - stage_started:.3f} с",
                  error=error.message).error("Этап «{}»: {}", stage, reason)
         await status_message.edit_text(
-            f"{reason}. Не удалось получить файл для обработки. Попробуйте отправить его ещё раз."
+            '<b>⚠️ Не удалось загрузить запись</b>\n\nОтправьте файл ещё раз.'
         )
         return
     except TelegramAPIError as error:
@@ -511,7 +505,7 @@ async def receive_file(
             "Этап «{}»: Telegram Bot API отклонил запрос на получение файла", stage
         )
         await status_message.edit_text(
-            "Telegram не смог предоставить файл для обработки. Попробуйте отправить его ещё раз."
+            '<b>⚠️ Не удалось загрузить запись</b>\n\nОтправьте файл ещё раз.'
         )
         return
     except (OSError, ValueError) as error:
@@ -521,8 +515,7 @@ async def receive_file(
             "Этап «{}»: {}", stage, reason
         )
         await status_message.edit_text(
-            "Файл получен из Telegram, но недоступен для чтения. "
-            "Проверьте подключение общего каталога файлов локального Bot API."
+            '<b>⚠️ Не удалось подготовить запись</b>\n\nОтправьте файл ещё раз.'
         )
         return
 
@@ -542,72 +535,114 @@ async def receive_file(
             'telegram_message_id': status_message.message_id,
             'request_key': f'{message.chat.id}:{message.message_id}',
         })
-    except ValueError as error:
-        await status_message.edit_text(str(error))
+    except ValueError:
+        await status_message.edit_text('<b>⚠️ Не удалось принять файл</b>\n\nОтправьте аудио или видео в поддерживаемом формате и допустимого размера.')
     except Exception:
-        await status_message.edit_text('Не удалось зарегистрировать задачу. Проверьте /history перед повторной отправкой.')
+        await status_message.edit_text('<b>⚠️ Не удалось добавить запись</b>\n\nПроверьте историю перед повторной отправкой.')
     else:
         log.bind(task_id=task['id'], event='task_registered').info('Задача передана в Core API; отслеживание продолжится через уведомления')
 
 
+async def _send_result(bot, chat, identifier, *, manual=False):
+    if identifier in SEND_BUSY:
+        return False
+    SEND_BUSY.add(identifier)
+    tracked = False
+    try:
+        record = await asyncio.to_thread(api_client.record, identifier)
+        if record.get('text') is None or record.get('deleting'):
+            raise ValueError('Результат пока недоступен')
+        if record['status'] == 'completed' and record['delivery_state'] != 'sent':
+            claimed = await asyncio.to_thread(api_client.request, f'/tasks/{identifier}/delivery',
+                                            {'action': 'start', 'manual': manual})
+            if not claimed['ok']:
+                return False
+            tracked = True
+        elif record['status'] == 'completed' and not manual:
+            return False
+        text = record['text']
+        filename = Path(record['filename'].replace('\\', '/')).stem
+        if record.get('partial'):
+            filename += '_неполный'
+            text = f"Неполный результат\nОбработано: {_progress(record, saved=True)}\n\n{text}"
+        try:
+            await bot.send_document(chat, BufferedInputFile(text.encode('utf-8'), filename=filename + '.txt'),
+                                    caption=(f"<b>📄 Неполный результат · №{record['number']}</b>" if record.get('partial') else
+                                             f"<b>📄 Расшифровка · №{record['number']}</b>") + '\n\n' + _recording_name(record),
+                                    request_timeout=60)
+        except TelegramAPIError:
+            if tracked:
+                await asyncio.to_thread(api_client.request, f'/tasks/{identifier}/delivery', {'action': 'failed'})
+            raise
+        if tracked:
+            CONFIRMED_SENDS.add(identifier)
+            await asyncio.to_thread(api_client.request, f'/tasks/{identifier}/delivery', {'action': 'sent'})
+            CONFIRMED_SENDS.discard(identifier)
+        return True
+    finally:
+        SEND_BUSY.discard(identifier)
+
+
+async def callback_guard(handler, event, data):
+    key = (event.from_user.id, event.data)
+    now = perf_counter()
+    if key in CALLBACK_BUSY or now - CALLBACK_LAST.get(key, 0) < 2:
+        await event.answer('Действие уже выполнено или выполняется')
+        return
+    CALLBACK_BUSY.add(key)
+    try:
+        return await handler(event, data)
+    finally:
+        CALLBACK_BUSY.discard(key)
+        CALLBACK_LAST[key] = perf_counter()
+        if len(CALLBACK_LAST) > 256:
+            CALLBACK_LAST.pop(min(CALLBACK_LAST, key=CALLBACK_LAST.get))
+
+
 async def notifications(bot):
-    delivered = set()
     previous = {}
-    updated_at = {}
     while True:
         try:
             records = await asyncio.to_thread(api_client.request, '/notifications')
         except Exception:
-            logger.bind(component='Telegram Adapter', event='notification_retry').warning('Не удалось получить уведомления; попытка будет повторена')
+            logger.bind(component='Telegram Adapter', event='notification_retry').warning('Не удалось получить уведомления')
             await asyncio.sleep(5)
             continue
+        active = {record['id'] for record in records}
+        CONFIRMED_SENDS.intersection_update(active)
+        previous = {key: value for key, value in previous.items() if key in active}
         for record in records:
+            identifier = record['id']
             try:
-                identifier = record['id']
-                number = record['number']
-                status = record['status']
-                chat = record['telegram_chat_id']
-                async def edit(text):
+                if identifier in CONFIRMED_SENDS:
+                    await asyncio.to_thread(api_client.request, f'/tasks/{identifier}/delivery', {'action': 'sent'})
+                    CONFIRMED_SENDS.discard(identifier)
+                    record = await asyncio.to_thread(api_client.request, f'/tasks/{identifier}')
+                if record['status'] == 'completed' and record['delivery_state'] == 'pending':
                     try:
-                        await bot.edit_message_text(text, chat_id=chat, message_id=record['telegram_message_id'],
-                                                    reply_markup=_partial_keyboard(record))
-                    except TelegramAPIError as error:
-                        return 'message is not modified' in error.message.lower()
-                    return True
-                if status in {'pending', 'processing'}:
-                    text = (f'Задача №{number}: {_progress(record)}' if status == 'processing'
-                            else f'Задача №{number}: ожидает обработки')
-                    if previous.get(identifier) != text and perf_counter() - updated_at.get(identifier, 0) >= 15:
-                        if await edit(text):
-                            previous[identifier] = text
-                            updated_at[identifier] = perf_counter()
-                    continue
-                previous.pop(identifier, None)
-                updated_at.pop(identifier, None)
-                final_text = (f'Задача №{number}: готово. Результат отправлен.' if status == 'completed'
-                              else _recording_summary(record))
-                if identifier not in delivered:
-                    if status == 'completed':
-                        result = await asyncio.to_thread(api_client.request, f'/tasks/{identifier}/result')
-                        await edit(f'Задача №{number}: речь распознана. Отправляю результат…')
-                        filename = Path(record['filename'].replace('\\', '/')).stem + '.txt'
-                        await bot.send_document(chat, BufferedInputFile(result['text'].encode('utf-8'), filename=filename), caption=f'Задача №{number}: завершена. Результат отправлен')
-                        delivered.add(identifier)
-                    else:
-                        if not await edit(final_text):
-                            await bot.send_message(chat, final_text, reply_markup=_partial_keyboard(record))
-                        delivered.add(identifier)
-                if status == 'completed' and not await edit(final_text):
-                    await bot.send_message(chat, final_text)
-                    logger.bind(component='Telegram Adapter', task_id=identifier, event='status_edit_failed').warning('Итоговый статус отправлен отдельным сообщением')
-                await asyncio.to_thread(api_client.request, f'/tasks/{identifier}/notified', {})
-                delivered.discard(identifier)
+                        await _send_result(bot, record['telegram_chat_id'], identifier)
+                    except TelegramAPIError:
+                        logger.bind(component='Telegram Adapter', task_id=identifier, event='delivery_failed').warning('Отправка TXT не подтверждена')
+                    record = await asyncio.to_thread(api_client.request, f'/tasks/{identifier}')
+                text = _recording_summary(record, progress_bar=True)
+                keyboard = _task_keyboard(record)
+                signature = (text, keyboard.model_dump_json())
+                if previous.get(identifier) != signature:
+                    try:
+                        await bot.edit_message_text(text, chat_id=record['telegram_chat_id'],
+                            message_id=record['telegram_message_id'], reply_markup=keyboard, parse_mode='HTML')
+                    except TelegramBadRequest as error:
+                        if 'message is not modified' not in error.message.lower():
+                            logger.bind(task_id=identifier, event='card_unavailable').warning('Карточка недоступна; результат остаётся в истории')
+                    previous[identifier] = signature
+                if record['status'] in {'completed', 'failed', 'paused'} and identifier not in SEND_BUSY:
+                    await asyncio.to_thread(api_client.request, f'/tasks/{identifier}/notified', {})
             except Exception:
-                logger.bind(component='Telegram Adapter', task_id=record['id'], event='notification_retry').warning('Не удалось доставить или подтвердить уведомление; попытка будет повторена')
+                logger.bind(component='Telegram Adapter', task_id=identifier, event='notification_retry').warning('Не удалось обновить карточку')
         try:
             await _show_history()
         except Exception:
-            logger.bind(component='Telegram Adapter', event='history_refresh_failed').warning('Не удалось обновить открытую историю')
+            logger.bind(component='Telegram Adapter', event='history_refresh_failed').warning('Не удалось обновить историю')
         await asyncio.sleep(5)
 
 async def main() -> None:
@@ -622,6 +657,7 @@ async def main() -> None:
     dispatcher["max_file_size_mb"] = max_file_size_mb
     dispatcher.message.filter(F.from_user.id == allowed_user_id)
     dispatcher.callback_query.filter(F.from_user.id == allowed_user_id)
+    dispatcher.callback_query.outer_middleware(callback_guard)
     dispatcher.message.register(start, CommandStart())
     dispatcher.message.register(history, Command("history"))
     dispatcher.callback_query.register(history_callback, F.data.startswith("history:"))
@@ -645,7 +681,11 @@ async def main() -> None:
     for stop_signal in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(stop_signal, request_stop)
 
-    async with Bot(token=token, session=session) as bot:
+    async with Bot(token=token, session=session, default=DefaultBotProperties(parse_mode='HTML')) as bot:
+        await bot.set_my_commands([
+            BotCommand(command='start', description='Отправить аудио'),
+            BotCommand(command='history', description='📂 История'),
+        ])
         notification_task = asyncio.create_task(notifications(bot))
         polling = asyncio.create_task(dispatcher.start_polling(
             bot, allowed_updates=["message", "callback_query"],

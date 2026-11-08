@@ -105,7 +105,7 @@ def _audio_chunks(path, start_sample):
         left_context = OVERLAP_SAMPLES
 
 
-def transcribe_chunks(path, *, start_sample=0, on_status=None):
+def transcribe_chunks(path, *, start_sample=0, on_status=None, on_progress=None):
     def status(text):
         if on_status is not None:
             on_status(text)
@@ -124,13 +124,17 @@ def transcribe_chunks(path, *, start_sample=0, on_status=None):
         begin = left_context / SAMPLE_RATE
         end = (left_context + core_samples) / SAMPLE_RATE
         # Контекст слышен модели с обеих сторон, но каждое слово принадлежит одной части.
-        text = "".join(
-            word.word for segment in segments for word in segment.words
-            if begin <= (word.start + word.end) / 2 < end
-        ).strip()
+        words = []
+        for segment in segments:
+            words.extend(word.word for word in segment.words
+                         if begin <= (word.start + word.end) / 2 < end)
+            if on_progress is not None:
+                completed = max(0, min(core_samples, int(segment.end * SAMPLE_RATE) - left_context))
+                on_progress(position + completed)
+        text = ''.join(words).strip()
         position += core_samples
         yield position, text
-        del segments, audio
+        del segments, audio, words
         gc.collect()
         status("Чтение аудио")
 

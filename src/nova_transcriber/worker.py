@@ -14,6 +14,7 @@ from nova_transcriber.safe_logging import configure_logging
 
 
 def _transcribe(pipe, path, processed_samples, total_samples):
+    configure_logging()
     try:
         from nova_transcriber import asr
 
@@ -25,11 +26,13 @@ def _transcribe(pipe, path, processed_samples, total_samples):
         for end_sample, text in asr.transcribe_chunks(
             path, start_sample=processed_samples,
             on_status=lambda stage: pipe.send(('stage', stage)),
+            on_progress=lambda samples: pipe.send(('progress', samples)),
         ):
             pipe.send(('chunk', end_sample, text))
             pipe.recv()
         pipe.send(('finished',))
     except Exception as error:
+        logger.bind(component='Whisper Worker', event='asr_error').opt(exception=error).error('Ошибка распознавания')
         reason = str(error) if isinstance(error, MediaError) else 'Не удалось обработать аудио или видео'
         retryable = isinstance(error, (OSError, RuntimeError)) and not isinstance(error, (FileNotFoundError, PermissionError))
         pipe.send(('error', reason, retryable))
@@ -47,16 +50,22 @@ def _run_task(connection, task, path, stopping, timeout):
     )
     started = perf_counter()
     stage_started = heartbeat = started
+    progress_saved_at = started
+    progress_samples = task['processed_samples']
     stage = 'Подготовка аудио'
     identifier = task['id']
     def elapsed():
         return task['processing_time'] + perf_counter() - started
 
     try:
+        connection.execute("UPDATE transcriptions SET progress_samples = processed_samples WHERE id = %s AND status = 'processing'", (identifier,))
         process.start()
         child.close()
         while not stopping.is_set():
             now = perf_counter()
+            if now - progress_saved_at >= 5:
+                database.update_progress(connection, identifier, progress_samples)
+                progress_saved_at = now
             if now - heartbeat >= 1:
                 state = connection.execute('SELECT status FROM transcriptions WHERE id = %s', (identifier,)).fetchone()
                 if state['status'] != 'processing':
@@ -74,6 +83,7 @@ def _run_task(connection, task, path, stopping, timeout):
                 return 'Процесс обработки неожиданно остановился', True, elapsed()
             if message[0] == 'stage':
                 stage = message[1]
+                logger.bind(component='Whisper Worker', task_id=identifier, event='stage').info('Этап: {}', stage)
                 stage_started = perf_counter()
                 connection.execute("UPDATE transcriptions SET stage = %s WHERE id = %s AND status = 'processing'", (stage, identifier))
             elif message[0] == 'duration':
@@ -82,6 +92,10 @@ def _run_task(connection, task, path, stopping, timeout):
                 task['total_samples'] = message[1]
                 parent.send(True)
                 stage_started = perf_counter()
+            elif message[0] == 'progress':
+                samples = message[1]
+                if task['processed_samples'] <= samples <= task['total_samples']:
+                    progress_samples = max(progress_samples, samples)
             elif message[0] == 'chunk':
                 end_sample, text = message[1:]
                 if not task['processed_samples'] < end_sample <= task['total_samples']:
@@ -89,6 +103,7 @@ def _run_task(connection, task, path, stopping, timeout):
                 if not database.save_chunk(connection, identifier, task['processed_samples'], end_sample, text, elapsed()):
                     return None, False, elapsed()
                 task['processed_samples'] = end_sample
+                progress_samples = end_sample
                 parent.send(True)
                 stage_started = perf_counter()
             elif message[0] == 'finished':

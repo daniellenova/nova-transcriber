@@ -19,7 +19,7 @@ SUPPORTED_MEDIA_EXTENSIONS = {
 def api_record(record):
     fields = ("id", "filename", "source_type", "file_size", "duration", "model",
               "created_at", "started_at", "finished_at", "processing_time", "error_reason", "status",
-              "processed_samples", "total_samples", "stage")
+              "processed_samples", "progress_samples", "total_samples", "stage", "delivery_state")
     return {**{key: record[key] for key in fields},
             "number": record.get('number'),
             "deleting": record['delete_requested'],

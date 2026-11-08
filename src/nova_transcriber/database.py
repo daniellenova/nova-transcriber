@@ -13,6 +13,7 @@ def _connect() -> psycopg.Connection:
         user=os.environ["PGUSER"],
         password=os.environ["PGPASSWORD"],
         row_factory=dict_row,
+        options="-c timezone=UTC",
     )
 
 
@@ -33,11 +34,58 @@ def init_db() -> None:
                 id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
                 recording_id BIGINT NOT NULL REFERENCES recordings(id),
                 model TEXT NOT NULL,
-                status TEXT NOT NULL CHECK (status IN ('processing', 'done', 'error')),
+                status TEXT NOT NULL CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
                 processing_time DOUBLE PRECISION CHECK (processing_time >= 0),
                 text TEXT,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
+        """)
+        connection.execute("LOCK TABLE transcriptions IN ACCESS EXCLUSIVE MODE")
+        connection.execute("""
+            ALTER TABLE transcriptions
+                ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ,
+                ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ,
+                ADD COLUMN IF NOT EXISTS error_reason TEXT,
+                ADD COLUMN IF NOT EXISTS user_id BIGINT
+        """)
+        connection.execute("""
+            ALTER TABLE transcriptions
+                DROP CONSTRAINT IF EXISTS transcriptions_status_check
+        """)
+        connection.execute("""
+            UPDATE transcriptions SET status = CASE status
+                WHEN 'done' THEN 'completed' WHEN 'error' THEN 'failed' ELSE status END
+            WHERE status IN ('done', 'error')
+        """)
+        connection.execute("""
+            ALTER TABLE transcriptions ADD CONSTRAINT transcriptions_status_check
+                CHECK (status IN ('pending', 'processing', 'completed', 'failed'))
+        """)
+        connection.execute("""
+            CREATE OR REPLACE FUNCTION guard_transcription_status() RETURNS trigger
+            LANGUAGE plpgsql AS $$
+            BEGIN
+                IF NEW.id IS DISTINCT FROM OLD.id THEN
+                    RAISE EXCEPTION 'Идентификатор задачи нельзя изменить';
+                END IF;
+                IF NEW.status IS DISTINCT FROM OLD.status AND NOT (
+                    (OLD.status = 'pending' AND NEW.status IN ('processing', 'failed')) OR
+                    (OLD.status = 'processing' AND NEW.status IN ('completed', 'failed'))
+                ) THEN
+                    RAISE EXCEPTION 'Недопустимый переход состояния задачи';
+                END IF;
+                IF NEW.status = 'completed' AND NEW.text IS NULL AND (
+                    OLD.status IS DISTINCT FROM NEW.status OR OLD.text IS NOT NULL
+                ) THEN
+                    RAISE EXCEPTION 'Результат задачи не сохранён';
+                END IF;
+                RETURN NEW;
+            END; $$
+        """)
+        connection.execute("""
+            CREATE OR REPLACE TRIGGER transcription_status_guard
+            BEFORE UPDATE ON transcriptions FOR EACH ROW
+            EXECUTE FUNCTION guard_transcription_status()
         """)
 
 
@@ -55,16 +103,26 @@ def create_recording(
         return row["id"]
 
 
-def create_transcription(recording_id: int, model: str) -> int:
+def create_transcription(recording_id: int, model: str, user_id: int | None = None) -> int:
     with _connect() as connection:
         row = connection.execute(
             """
-            INSERT INTO transcriptions (recording_id, model, status)
-            VALUES (%s, %s, 'processing') RETURNING id
+            INSERT INTO transcriptions (recording_id, model, status, user_id)
+            VALUES (%s, %s, 'pending', %s) RETURNING id
             """,
-            (recording_id, model),
+            (recording_id, model, user_id),
         ).fetchone()
         return row["id"]
+
+
+def start_transcription(transcription_id: int) -> None:
+    with _connect() as connection:
+        cursor = connection.execute(
+            """UPDATE transcriptions SET status = 'processing', started_at = clock_timestamp()
+            WHERE id = %s AND status = 'pending'""", (transcription_id,),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("Задача не найдена или переход состояния запрещён")
 
 
 def complete_transcription(
@@ -73,8 +131,9 @@ def complete_transcription(
     with _connect() as connection:
         cursor = connection.execute(
             """
-            UPDATE transcriptions SET text = %s, processing_time = %s, status = 'done'
-            WHERE id = %s
+            UPDATE transcriptions SET text = %s, processing_time = %s,
+                status = 'completed', finished_at = clock_timestamp()
+            WHERE id = %s AND status = 'processing'
             """,
             (text, processing_time, transcription_id),
         )
@@ -83,15 +142,17 @@ def complete_transcription(
 
 
 def fail_transcription(
-    transcription_id: int, processing_time: float | None = None
+    transcription_id: int, processing_time: float | None = None,
+    error_reason: str = "Не удалось обработать файл",
 ) -> None:
     with _connect() as connection:
         cursor = connection.execute(
             """
-            UPDATE transcriptions SET status = 'error', processing_time = %s
-            WHERE id = %s
+            UPDATE transcriptions SET status = 'failed', processing_time = %s,
+                finished_at = clock_timestamp(), error_reason = %s, text = NULL
+            WHERE id = %s AND status IN ('pending', 'processing')
             """,
-            (processing_time, transcription_id),
+            (processing_time, error_reason, transcription_id),
         )
         if cursor.rowcount == 0:
             raise ValueError(f"Транскрибация не найдена: {transcription_id}")
@@ -103,7 +164,9 @@ def get_recent_transcriptions(limit: int = 10) -> list[dict[str, Any]]:
     with _connect() as connection:
         return connection.execute(
             """
-            SELECT t.*, r.filename, r.source_type, r.file_size, r.duration
+            SELECT t.*, CASE t.status WHEN 'completed' THEN 'done'
+                WHEN 'failed' THEN 'error' ELSE t.status END AS status,
+                r.filename, r.source_type, r.file_size, r.duration
             FROM transcriptions AS t
             JOIN recordings AS r ON r.id = t.recording_id
             ORDER BY t.created_at DESC, t.id DESC LIMIT %s
@@ -116,7 +179,9 @@ def get_transcription(transcription_id: int) -> dict[str, Any] | None:
     with _connect() as connection:
         return connection.execute(
             """
-            SELECT t.*, r.filename, r.source_type, r.file_size, r.duration
+            SELECT t.*, CASE t.status WHEN 'completed' THEN 'done'
+                WHEN 'failed' THEN 'error' ELSE t.status END AS status,
+                r.filename, r.source_type, r.file_size, r.duration
             FROM transcriptions AS t
             JOIN recordings AS r ON r.id = t.recording_id
             WHERE t.id = %s

@@ -20,6 +20,7 @@ from aiogram.types import (
 from nova_transcriber import core, database
 from nova_transcriber.errors import MediaError
 from nova_transcriber.safe_logging import configure_logging
+from nova_transcriber.safe_logging import task_log
 
 
 FILE_ROOT = Path("/var/lib/telegram-bot-api")
@@ -162,7 +163,33 @@ async def receive_file(
         await message.answer(too_large_message)
         return
 
-    await message.answer("Файл получен. Начинаю обработку; файлы обрабатываются по одному.")
+    task_id = None
+    status_message = None
+
+    async def update_status(identifier: int, status: str) -> None:
+        nonlocal task_id, status_message
+        task_id = identifier
+        text = (f"Файл получен. Задача №{identifier} создана. Ожидает обработки"
+                if status == "pending" else f"Задача №{identifier}: обрабатывается")
+        try:
+            if status_message is None:
+                status_message = await message.answer(text)
+            else:
+                await status_message.edit_text(text)
+        except TelegramAPIError:
+            task_log(identifier, "notification_failed", "Не удалось обновить сообщение о состоянии",
+                     error="Ошибка отправки сообщения Telegram")
+
+    async def report_error(text: str) -> None:
+        text = f"Задача №{task_id}: ошибка. {text}" if task_id is not None else text
+        if status_message is not None:
+            try:
+                await status_message.edit_text(text)
+                return
+            except TelegramAPIError:
+                pass
+        await message.answer(text)
+
     try:
         text = await core.process_recording(
             path=path,
@@ -170,25 +197,36 @@ async def receive_file(
             source_type=source_type,
             file_size=file_size,
             duration=getattr(media, "duration", None),
+            user_id=message.from_user.id if message.from_user else None,
+            on_status=update_status,
         )
     except MediaError as error:
-        await message.answer(str(error))
+        await report_error(str(error))
         return
     except Exception:
-        logging.getLogger(__name__).exception("Ошибка обработки файла")
-        await message.answer("Не удалось обработать файл. Попробуйте повторить позже.")
+        if task_id is None:
+            logging.getLogger(__name__).error("Не удалось зарегистрировать задачу обработки файла")
+        await report_error("Не удалось обработать файл. Попробуйте повторить позже.")
         return
 
     output_name = Path(filename.replace("\\", "/")).stem + ".txt"
     try:
         await message.answer_document(
             BufferedInputFile(text.encode("utf-8"), filename=output_name),
-            caption="Готово.",
+            caption=f"Задача №{task_id}: завершена. Результат отправлен",
         )
+        task_log(task_id, "txt_sent", "Результат отправлен пользователю")
     except TelegramAPIError:
+        task_log(task_id, "txt_send_failed", "Результат сохранён, но TXT не отправлен",
+                 error="Ошибка отправки документа Telegram")
         await message.answer(
-            "Текст сохранён в базе, но отправить TXT не удалось."
+            f"Задача №{task_id}: завершена. Текст сохранён в базе, но отправить TXT не удалось."
         )
+    if status_message is not None:
+        try:
+            await status_message.edit_text(f"Задача №{task_id}: завершена")
+        except TelegramAPIError:
+            pass
 
 
 async def main() -> None:

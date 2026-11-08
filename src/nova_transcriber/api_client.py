@@ -1,7 +1,9 @@
 import json
 import os
+from http.client import HTTPException
+from time import sleep
 from urllib.request import Request, urlopen
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 
 def request(path, data=None):
@@ -9,15 +11,24 @@ def request(path, data=None):
                   data=None if data is None else json.dumps(data).encode(),
                   headers={'Authorization': 'Bearer ' + os.environ['CORE_API_TOKEN'],
                            'Content-Type': 'application/json'})
-    try:
-        with urlopen(req, timeout=15) as response:
-            return json.load(response)
-    except HTTPError as error:
-        if error.code == 400:
+    can_retry = data is None or path.endswith('/notified') or (
+        path == '/tasks' and bool(data.get('request_key'))
+    )
+    for attempt in range(3):
+        try:
+            with urlopen(req, timeout=15) as response:
+                return json.load(response)
+        except HTTPError as error:
             with error:
-                detail = json.load(error).get('detail', 'Некорректные данные задачи')
-            raise ValueError(detail) from None
-        raise
+                if error.code == 400:
+                    detail = json.load(error).get('detail', 'Некорректные данные задачи')
+                    raise ValueError(detail) from None
+            if not can_retry or attempt == 2 or error.code not in {429, 500, 502, 503, 504}:
+                raise
+        except (URLError, OSError, HTTPException):
+            if not can_retry or attempt == 2:
+                raise
+        sleep(2 ** attempt)
 
 
 def record(identifier):

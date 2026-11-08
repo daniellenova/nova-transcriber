@@ -5,7 +5,7 @@ from pathlib import Path
 from loguru import logger
 
 from nova_transcriber import database
-from nova_transcriber.config import get_max_file_size_mb
+from nova_transcriber.config import get_max_file_size_mb, get_positive_int
 from nova_transcriber.errors import EmptyFileError, UnsupportedFormatError
 
 
@@ -18,7 +18,8 @@ SUPPORTED_MEDIA_EXTENSIONS = {
 
 def api_record(record):
     fields = ("id", "filename", "source_type", "file_size", "duration", "model",
-              "created_at", "started_at", "finished_at", "processing_time", "error_reason", "status")
+              "created_at", "started_at", "finished_at", "processing_time", "error_reason", "status",
+              "processed_samples", "total_samples", "stage")
     return {key: record[key] for key in fields}
 
 
@@ -48,6 +49,8 @@ def create_api_task(data, user_id):
     duration = data.get("duration")
     if duration is not None and (type(duration) not in {int, float} or not math.isfinite(duration) or duration < 0):
         raise ValueError("Недопустимая длительность")
+    if duration is not None and duration > get_positive_int("MAX_DURATION_SECONDS", 43200):
+        raise ValueError("Запись превышает допустимую длительность")
     for field in ('telegram_chat_id', 'telegram_message_id'):
         if data.get(field) is not None and (type(data[field]) is not int or not -9223372036854775808 <= data[field] <= 9223372036854775807):
             raise ValueError('Недопустимые метаданные уведомления')

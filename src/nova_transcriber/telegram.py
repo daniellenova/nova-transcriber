@@ -16,7 +16,7 @@ from loguru import logger
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
-from aiogram.exceptions import TelegramAPIError, TelegramNetworkError
+from aiogram.exceptions import TelegramAPIError, TelegramNetworkError, TelegramRetryAfter, TelegramServerError
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     BufferedInputFile,
@@ -27,11 +27,13 @@ from aiogram.types import (
 )
 
 
-from nova_transcriber.config import get_max_file_size_mb, get_owner_id
+from nova_transcriber.config import check_disk_space, get_max_file_size_mb, get_owner_id, get_positive_int
+from nova_transcriber.errors import MediaError
 from nova_transcriber.safe_logging import configure_logging
 
 
 FILE_ROOT = Path("/var/lib/telegram-bot-api")
+DOWNLOAD_LOCK = asyncio.Lock()
 
 
 async def start(message: Message) -> None:
@@ -53,6 +55,15 @@ def _duration(value: float) -> str:
     if seconds or not parts:
         parts.append(f"{seconds} с")
     return " ".join(parts)
+
+
+def _progress(record: dict) -> str:
+    total = record.get('total_samples')
+    if not total:
+        return record.get('stage') or 'Подготовка аудио'
+    processed = record.get('processed_samples', 0)
+    percent = min(100, processed * 100 // total)
+    return f'{percent}% · {_duration(processed / 16000)} из {_duration(total / 16000)}'
 
 
 def _recording_summary(record: dict) -> str:
@@ -91,6 +102,8 @@ def _recording_summary(record: dict) -> str:
         "failed": "Ошибка",
     }
     lines.append(f"Состояние: {statuses.get(record.get('status'), 'Неизвестно')}")
+    if record.get('status') in {'processing', 'failed'} and record.get('total_samples'):
+        lines.append(f"Обработано: {_progress(record)}")
     if record.get("status") == "failed" and record.get("error_reason"):
         reason = record["error_reason"].rstrip(".")
         safe_reasons = {
@@ -102,7 +115,18 @@ def _recording_summary(record: dict) -> str:
             "Обработка отменена до начала распознавания",
             "Обработка прервана до начала распознавания",
             "Обработка прервана из-за остановки или перезапуска сервиса",
+            "Запись превышает допустимую длительность",
+            "Файл превышает допустимый размер",
+            "Недостаточно свободного места на диске",
+            "Превышено число попыток восстановления",
+            "Исходный файл недоступен",
+            "Длительность исходного файла изменилась",
+            "Процесс обработки неожиданно остановился",
         }
+        safe_reasons.update(f'Превышено время этапа «{stage}»' for stage in (
+            'Подготовка аудио', 'Определение длительности', 'Загрузка модели',
+            'Чтение аудио', 'Распознавание',
+        ))
         reasons = {
             "Не удалось сохранить результат в PostgreSQL": "Не удалось сохранить результат",
             "Не удалось начать обработку в PostgreSQL": "Не удалось начать обработку",
@@ -183,7 +207,7 @@ async def history_callback(callback: CallbackQuery) -> None:
 
 
 async def receive_file(
-    message: Message, bot: Bot, max_file_size_mb: Decimal = Decimal("100")
+    message: Message, bot: Bot, max_file_size_mb: Decimal = Decimal("1024")
 ) -> None:
     log = logger.bind(component=f"Telegram, сообщение №{message.message_id}")
     received_at = perf_counter()
@@ -209,6 +233,10 @@ async def receive_file(
     if isinstance(metadata_size, int) and metadata_size > max_file_size:
         await status_message.edit_text(too_large_message)
         return
+    duration = getattr(media, 'duration', None)
+    if duration is not None and duration > get_positive_int('MAX_DURATION_SECONDS', 43200):
+        await status_message.edit_text('Запись превышает допустимую длительность.')
+        return
 
     stage = "Запрос getFile"
     stage_started = perf_counter()
@@ -217,7 +245,20 @@ async def receive_file(
             "Начат запрос getFile; размер по данным Telegram: {} байт; "
             "тайм-аут всего HTTP-запроса: 600 с", metadata_size if metadata_size is not None else "неизвестен"
         )
-        file = await bot.get_file(media.file_id, request_timeout=600)
+        async with DOWNLOAD_LOCK:
+            check_disk_space(FILE_ROOT, metadata_size if isinstance(metadata_size, int) and metadata_size > 0 else int(max_file_size))
+            for attempt in range(3):
+                try:
+                    file = await bot.get_file(media.file_id, request_timeout=600)
+                    break
+                except (TelegramNetworkError, TelegramServerError, TelegramRetryAfter) as error:
+                    if attempt == 2:
+                        raise
+                    delay = error.retry_after if isinstance(error, TelegramRetryAfter) else 2 ** attempt
+                    if delay > 30:
+                        raise
+                    log.bind(event='download_retry').warning('Повтор получения файла, попытка {} из 3', attempt + 2)
+                    await asyncio.sleep(delay)
         log.bind(event="get_file_completed", duration=f"{perf_counter() - stage_started:.3f} с").info(
             "Получен ответ getFile"
         )
@@ -251,6 +292,9 @@ async def receive_file(
         log.bind(event="file_size_read", duration=f"{perf_counter() - stage_started:.3f} с").info(
             "Получен размер локального файла: {} байт", file_size
         )
+    except MediaError as error:
+        await status_message.edit_text(str(error))
+        return
     except TelegramNetworkError as error:
         timed_out = isinstance(error.__cause__, asyncio.TimeoutError)
         reason = ("Истекло время ожидания загрузки файла из Telegram"
@@ -309,6 +353,7 @@ async def receive_file(
 async def notifications(bot):
     delivered = set()
     previous = {}
+    updated_at = {}
     while True:
         try:
             records = await asyncio.to_thread(api_client.request, '/notifications')
@@ -328,13 +373,15 @@ async def notifications(bot):
                         return 'message is not modified' in error.message.lower()
                     return True
                 if status in {'pending', 'processing'}:
-                    if previous.get(identifier) != status:
-                        text = (f'Задача №{identifier}: распознаю речь…' if status == 'processing'
-                                else f'Файл получен. Задача №{identifier} создана. Ожидает обработки')
+                    text = (f'Задача №{identifier}: {_progress(record)}' if status == 'processing'
+                            else f'Задача №{identifier}: ожидает обработки')
+                    if previous.get(identifier) != text and perf_counter() - updated_at.get(identifier, 0) >= 15:
                         if await edit(text):
-                            previous[identifier] = status
+                            previous[identifier] = text
+                            updated_at[identifier] = perf_counter()
                     continue
                 previous.pop(identifier, None)
+                updated_at.pop(identifier, None)
                 final_text = (f'Задача №{identifier}: готово. Результат отправлен.' if status == 'completed'
                               else _recording_summary(record))
                 if identifier not in delivered:
@@ -345,9 +392,10 @@ async def notifications(bot):
                         await bot.send_document(chat, BufferedInputFile(result['text'].encode('utf-8'), filename=filename), caption=f'Задача №{identifier}: завершена. Результат отправлен')
                         delivered.add(identifier)
                     else:
-                        await bot.send_message(chat, final_text)
+                        if not await edit(final_text):
+                            await bot.send_message(chat, final_text)
                         delivered.add(identifier)
-                if not await edit(final_text):
+                if status == 'completed' and not await edit(final_text):
                     await bot.send_message(chat, final_text)
                     logger.bind(component='Telegram Adapter', task_id=identifier, event='status_edit_failed').warning('Итоговый статус отправлен отдельным сообщением')
                 await asyncio.to_thread(api_client.request, f'/tasks/{identifier}/notified', {})
@@ -359,6 +407,8 @@ async def notifications(bot):
 async def main() -> None:
     configure_logging()
     max_file_size_mb = get_max_file_size_mb()
+    get_positive_int('MAX_DURATION_SECONDS', 43200)
+    get_positive_int('MIN_FREE_DISK_MB', 512)
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     allowed_user_id = get_owner_id()
 

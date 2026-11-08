@@ -9,7 +9,7 @@ from urllib.parse import urlsplit, parse_qs
 from loguru import logger
 
 from nova_transcriber import core, database
-from nova_transcriber.config import get_max_file_size_mb, get_owner_id
+from nova_transcriber.config import get_max_file_size_mb, get_owner_id, get_positive_int
 from nova_transcriber.safe_logging import configure_logging
 
 
@@ -101,6 +101,7 @@ def main():
         raise ValueError("CORE_API_TOKEN должен содержать не менее 32 символов")
     get_owner_id()
     get_max_file_size_mb()
+    get_positive_int('MAX_DURATION_SECONDS', 43200)
     if not Path(os.environ["CORE_MEDIA_ROOT"]).is_dir():
         raise ValueError("CORE_MEDIA_ROOT должен указывать на доступный каталог")
     database.init_db()

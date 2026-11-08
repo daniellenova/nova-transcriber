@@ -8,10 +8,3 @@
 !src/**
 **/__pycache__/
 **/*.py[cod]
-.git/
-.venv/
-models/
-data/
-**/__pycache__/
-**/*.py[cod]
-.env

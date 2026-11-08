@@ -2,7 +2,13 @@ import os
 from typing import Any
 
 import psycopg
+from loguru import logger
 from psycopg.rows import dict_row
+
+
+_TASK_COLUMNS = """t.id, t.model, t.status, t.processing_time, t.created_at,
+    t.started_at, t.finished_at, t.error_reason, t.telegram_chat_id, t.telegram_message_id,
+    r.filename, r.source_type, r.file_size, r.duration"""
 
 
 def _connect() -> psycopg.Connection:
@@ -20,6 +26,8 @@ def _connect() -> psycopg.Connection:
 
 def init_db() -> None:
     with _connect() as connection:
+        # Core и Worker могут одновременно запускаться с пустой базой.
+        connection.execute("SELECT pg_advisory_xact_lock(19790520, 1)")
         connection.execute("""
             CREATE TABLE IF NOT EXISTS recordings (
                 id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -44,13 +52,15 @@ def init_db() -> None:
         connection.execute("LOCK TABLE transcriptions IN ACCESS EXCLUSIVE MODE")
         connection.execute("""
             ALTER TABLE transcriptions
+                ADD COLUMN IF NOT EXISTS file_key TEXT,
+                ADD COLUMN IF NOT EXISTS request_key TEXT,
+                ADD COLUMN IF NOT EXISTS delivery_notified BOOLEAN NOT NULL DEFAULT FALSE,
                 ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ,
                 ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ,
                 ADD COLUMN IF NOT EXISTS error_reason TEXT,
                 ADD COLUMN IF NOT EXISTS user_id BIGINT,
                 ADD COLUMN IF NOT EXISTS telegram_chat_id BIGINT,
-                ADD COLUMN IF NOT EXISTS telegram_message_id BIGINT,
-                ADD COLUMN IF NOT EXISTS interruption_notified BOOLEAN NOT NULL DEFAULT FALSE
+                ADD COLUMN IF NOT EXISTS telegram_message_id BIGINT
         """)
         connection.execute("""
             ALTER TABLE transcriptions
@@ -96,81 +106,74 @@ def init_db() -> None:
 INTERRUPTED_REASON = "Обработка прервана из-за остановки или перезапуска сервиса"
 
 
-def recover_transcriptions(user_id: int) -> list[int]:
+def claim_task(connection):
+    # Сеансовая блокировка остаётся после фиксации processing и освобождается
+    # PostgreSQL при разрыве соединения. Прерванные задачи не запускаются повторно.
+    with connection.transaction():
+        after_id = 0
+        while True:
+            row = connection.execute("""
+                SELECT id, status, file_key FROM transcriptions
+                WHERE file_key IS NOT NULL AND status IN ('pending', 'processing') AND id > %s
+                ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED
+            """, (after_id,)).fetchone()
+            if row is None:
+                return None
+            after_id = row['id']
+            locked = connection.execute(
+                "SELECT pg_try_advisory_lock(%s) AS acquired", (-row['id'],)
+            ).fetchone()['acquired']
+            if not locked:
+                continue
+            if row['status'] == 'processing':
+                connection.execute("""
+                    UPDATE transcriptions SET status = 'failed', error_reason = %s,
+                        finished_at = clock_timestamp() WHERE id = %s
+                """, (INTERRUPTED_REASON, row['id']))
+                connection.execute("SELECT pg_advisory_unlock(%s)", (-row['id'],))
+                logger.bind(component="Очередь", task_id=row['id'], event="interrupted",
+                            error=INTERRUPTED_REASON).warning("Прерванная задача переведена в состояние ошибки")
+                continue
+            connection.execute("""
+                UPDATE transcriptions SET status = 'processing', started_at = clock_timestamp()
+                WHERE id = %s
+            """, (row['id'],))
+            return row
+
+
+def create_task(filename, source_type, file_size, duration, user_id, file_key, metadata=None):
     with _connect() as connection:
-        rows = connection.execute(
-            """
-            UPDATE transcriptions SET status = 'failed',
-                finished_at = clock_timestamp(), error_reason = %s, text = NULL
-            WHERE user_id = %s AND status IN ('pending', 'processing')
-            RETURNING id
-            """,
-            (INTERRUPTED_REASON, user_id),
-        ).fetchall()
-    return [row["id"] for row in rows]
-
-
-def save_status_message(transcription_id: int, chat_id: int, message_id: int) -> None:
-    with _connect() as connection:
-        connection.execute(
-            """UPDATE transcriptions SET telegram_chat_id = %s, telegram_message_id = %s
-            WHERE id = %s""", (chat_id, message_id, transcription_id),
-        )
-
-
-def get_interrupted_notifications(user_id: int) -> list[dict[str, Any]]:
-    with _connect() as connection:
-        return connection.execute(
-            """SELECT id, user_id, telegram_chat_id, telegram_message_id
-            FROM transcriptions
-            WHERE user_id = %s AND status = 'failed' AND error_reason = %s
-                AND NOT interruption_notified
-            ORDER BY id""", (user_id, INTERRUPTED_REASON),
-        ).fetchall()
-
-
-def mark_interruption_notified(transcription_id: int) -> None:
-    with _connect() as connection:
-        connection.execute(
-            "UPDATE transcriptions SET interruption_notified = TRUE WHERE id = %s",
-            (transcription_id,),
-        )
-
-
-def create_recording(
-    filename: str, source_type: str, file_size: int, duration: float | None = None
-) -> int:
-    with _connect() as connection:
-        row = connection.execute(
-            """
-            INSERT INTO recordings (filename, source_type, file_size, duration)
-            VALUES (%s, %s, %s, %s) RETURNING id
-            """,
+        metadata = metadata or {}
+        key = metadata.get('request_key')
+        if key:
+            connection.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))', (key,))
+            existing = connection.execute('SELECT id, status FROM transcriptions WHERE user_id = %s AND request_key = %s', (user_id, key)).fetchone()
+            if existing:
+                return existing
+        recording = connection.execute(
+            """INSERT INTO recordings (filename, source_type, file_size, duration)
+            VALUES (%s, %s, %s, %s) RETURNING id""",
             (filename, source_type, file_size, duration),
         ).fetchone()
-        return row["id"]
-
-
-def create_transcription(recording_id: int, model: str, user_id: int | None = None) -> int:
-    with _connect() as connection:
-        row = connection.execute(
-            """
-            INSERT INTO transcriptions (recording_id, model, status, user_id)
-            VALUES (%s, %s, 'pending', %s) RETURNING id
-            """,
-            (recording_id, model, user_id),
+        return connection.execute(
+            """INSERT INTO transcriptions (recording_id, model, status, user_id, file_key, request_key, telegram_chat_id, telegram_message_id)
+            VALUES (%s, 'large-v3', 'pending', %s, %s, %s, %s, %s) RETURNING id, status""",
+            (recording["id"], user_id, file_key, key, metadata.get('telegram_chat_id'), metadata.get('telegram_message_id')),
         ).fetchone()
-        return row["id"]
 
 
-def start_transcription(transcription_id: int) -> None:
+def notifications(user_id):
     with _connect() as connection:
-        cursor = connection.execute(
-            """UPDATE transcriptions SET status = 'processing', started_at = clock_timestamp()
-            WHERE id = %s AND status = 'pending'""", (transcription_id,),
-        )
-        if cursor.rowcount != 1:
-            raise ValueError("Задача не найдена или переход состояния запрещён")
+        return connection.execute(f'''SELECT {_TASK_COLUMNS} FROM transcriptions t
+            JOIN recordings r ON r.id=t.recording_id
+            WHERE t.user_id=%s AND t.telegram_chat_id IS NOT NULL
+            AND NOT (t.file_key IS NULL AND t.status = 'completed')
+            AND NOT t.delivery_notified ORDER BY t.id''', (user_id,)).fetchall()
+
+
+def acknowledge(identifier, user_id):
+    with _connect() as connection:
+        connection.execute("UPDATE transcriptions SET delivery_notified=TRUE WHERE id=%s AND user_id=%s AND status IN ('completed','failed')", (identifier, user_id))
 
 
 def complete_transcription(
@@ -211,10 +214,8 @@ def get_recent_transcriptions(limit: int = 10, user_id: int | None = None) -> li
         raise ValueError("Количество транскрибаций должно быть положительным")
     with _connect() as connection:
         return connection.execute(
-            """
-            SELECT t.*, CASE t.status WHEN 'completed' THEN 'done'
-                WHEN 'failed' THEN 'error' ELSE t.status END AS status,
-                r.filename, r.source_type, r.file_size, r.duration
+            f"""
+            SELECT {_TASK_COLUMNS}
             FROM transcriptions AS t
             JOIN recordings AS r ON r.id = t.recording_id
             WHERE t.user_id = %s
@@ -224,16 +225,15 @@ def get_recent_transcriptions(limit: int = 10, user_id: int | None = None) -> li
         ).fetchall()
 
 
-def get_transcription(transcription_id: int, user_id: int | None = None) -> dict[str, Any] | None:
+def get_transcription(transcription_id: int, user_id: int | None = None, *, include_text=False) -> dict[str, Any] | None:
     with _connect() as connection:
         return connection.execute(
-            """
-            SELECT t.*, CASE t.status WHEN 'completed' THEN 'done'
-                WHEN 'failed' THEN 'error' ELSE t.status END AS status,
-                r.filename, r.source_type, r.file_size, r.duration
+            f"""
+            SELECT {_TASK_COLUMNS}{', t.text' if include_text else ''}
             FROM transcriptions AS t
             JOIN recordings AS r ON r.id = t.recording_id
             WHERE t.id = %s AND t.user_id = %s
             """,
             (transcription_id, user_id),
         ).fetchone()
+

@@ -643,23 +643,34 @@ name = "nova-transcriber"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "loguru" },
+    { name = "tzdata", marker = "sys_platform == 'win32'" },
+]
+
+[package.optional-dependencies]
+postgres = [
+    { name = "psycopg", extra = ["binary"] },
+]
+telegram = [
     { name = "aiogram" },
+]
+worker = [
     { name = "av" },
     { name = "ctranslate2" },
     { name = "faster-whisper" },
-    { name = "loguru" },
-    { name = "psycopg", extra = ["binary"] },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "aiogram", specifier = ">=3,<4" },
-    { name = "av", specifier = "==18.1.0" },
-    { name = "ctranslate2", specifier = "==4.7.2" },
-    { name = "faster-whisper", specifier = ">=1.2.1" },
+    { name = "aiogram", marker = "extra == 'telegram'", specifier = ">=3,<4" },
+    { name = "av", marker = "extra == 'worker'", specifier = "==18.1.0" },
+    { name = "ctranslate2", marker = "extra == 'worker'", specifier = "==4.7.2" },
+    { name = "faster-whisper", marker = "extra == 'worker'", specifier = ">=1.2.1" },
     { name = "loguru", specifier = ">=0.7.3" },
-    { name = "psycopg", extras = ["binary"], specifier = ">=3.3.8" },
+    { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.3.8" },
+    { name = "tzdata", marker = "sys_platform == 'win32'" },
 ]
+provides-extras = ["postgres", "telegram", "worker"]
 
 [[package]]
 name = "numpy"

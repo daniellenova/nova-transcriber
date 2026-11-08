@@ -182,5 +182,8 @@ cython_debug/
 
 /data/*
 !/data/.gitkeep
+!/data/telegram/
+/data/telegram/*
+!/data/telegram/.gitkeep
 /models/*
 !/models/.gitkeep

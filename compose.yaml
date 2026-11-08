@@ -1,24 +1,69 @@
 services:
-  transcriber:
-    build: .
+  core-api:
+    build:
+      context: .
+      target: app
+    restart: on-failure
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      <<: &database-environment
+        PGHOST: postgres
+        PGPORT: "5432"
+        PGDATABASE: ${POSTGRES_DB:?Укажите POSTGRES_DB в .env}
+        PGUSER: ${POSTGRES_USER:?Укажите POSTGRES_USER в .env}
+        PGPASSWORD: ${POSTGRES_PASSWORD:?Укажите POSTGRES_PASSWORD в .env}
+      CORE_API_HOST: "0.0.0.0"
+      CORE_API_TOKEN: ${CORE_API_TOKEN:-}
+      TELEGRAM_ALLOWED_USER_ID: ${TELEGRAM_ALLOWED_USER_ID:-}
+      CORE_MEDIA_ROOT: /media
+      MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB-100}
+      DISPLAY_TIMEZONE: ${DISPLAY_TIMEZONE:-Europe/Moscow}
+    volumes:
+      - ./data:/media:ro
+      - telegram_data:/media/telegram:ro
+
+  whisper-worker:
+    build:
+      context: .
+      target: worker
+    restart: on-failure
+    stop_grace_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *database-environment
+      CORE_MEDIA_ROOT: /media
+      DISPLAY_TIMEZONE: ${DISPLAY_TIMEZONE:-Europe/Moscow}
+    volumes:
+      - ./data:/media:ro
+      - telegram_data:/media/telegram:ro
+      - ./models:/app/models:ro
+
+  telegram-adapter:
+    build:
+      context: .
+      target: app
+      args:
+        COMPONENT_EXTRA: telegram
+    container_name: nova-telegram-adapter
     entrypoint: ["/app/.venv/bin/python", "-m", "nova_transcriber.telegram"]
     restart: on-failure
     depends_on:
-      - postgres
+      - core-api
       - telegram-bot-api
     environment:
-      PGHOST: postgres
-      PGPORT: "5432"
-      PGDATABASE: ${POSTGRES_DB:?Укажите POSTGRES_DB в .env}
-      PGUSER: ${POSTGRES_USER:?Укажите POSTGRES_USER в .env}
-      PGPASSWORD: ${POSTGRES_PASSWORD:?Укажите POSTGRES_PASSWORD в .env}
+      CORE_API_URL: http://core-api:8000
+      CORE_API_TOKEN: ${CORE_API_TOKEN:-}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_ALLOWED_USER_ID: ${TELEGRAM_ALLOWED_USER_ID:-}
       MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB-100}
       DISPLAY_TIMEZONE: ${DISPLAY_TIMEZONE:-Europe/Moscow}
     volumes:
-      - ./data:/data
-      - ./models:/app/models:ro
       - telegram_data:/var/lib/telegram-bot-api:ro
 
   telegram-bot-api:
@@ -32,6 +77,11 @@ services:
 
   postgres:
     image: postgres:16-bookworm
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
     ports:
       - "127.0.0.1:5433:5432"
     environment:

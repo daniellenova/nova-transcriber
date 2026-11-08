@@ -8,38 +8,21 @@ from loguru import logger
 
 
 def sanitize(value: str) -> str:
-    for name, secret in os.environ.items():
+    secrets = {
+        secret for name, secret in os.environ.items()
         if secret and (any(part in name.upper() for part in (
             "TOKEN", "PASSWORD", "SECRET", "API_KEY", "API_HASH", "DSN", "DATABASE_URL",
             "PRIVATE_KEY", "ACCESS_KEY", "CREDENTIAL", "AUTH",
-        )) or name.upper() == "PGPASSFILE"):
-            value = value.replace(secret, "[REDACTED]")
+        )) or name.upper() == "PGPASSFILE")
+    }
+    for secret in sorted(secrets, key=len, reverse=True):
+        value = value.replace(secret, "[REDACTED]")
     value = re.sub(r"\b\d{5,}:[A-Za-z0-9_-]{20,}", "[REDACTED]", value)
     return re.sub(r"(postgres(?:ql)?://[^:\s/]+:)[^@\s]+@", r"\1[REDACTED]@", value)
 
 
-def task_log(task_id: int, event: str, message: str, *,
-             duration: float | None = None, error: str | None = None) -> None:
-    logger.bind(component="Core", task_id=task_id, event=event,
-                duration="—" if duration is None else f"{duration:.3f} с",
-                error=error or "—").log("ERROR" if error else "INFO", message)
-
-
 def configure_logging() -> None:
     log_timezone = ZoneInfo(os.environ.get("DISPLAY_TIMEZONE") or "Europe/Moscow")
-    original_factory = logging.getLogRecordFactory()
-
-    def record_factory(*args, **kwargs):
-        record = original_factory(*args, **kwargs)
-        record.msg = sanitize(record.getMessage())
-        record.args = ()
-        if record.exc_info:
-            record.exc_text = sanitize(logging.Formatter().formatException(record.exc_info))
-        if record.stack_info:
-            record.stack_info = sanitize(record.stack_info)
-        return record
-
-    logging.setLogRecordFactory(record_factory)
 
     def patch_record(record):
         record["message"] = sanitize(record["message"])
@@ -64,7 +47,7 @@ def configure_logging() -> None:
     class LoguruHandler(logging.Handler):
         def emit(self, record):
             logger.bind(component=record.name, event="library_message").log(
-                record.levelname, sanitize(record.getMessage())
+                record.levelname, record.getMessage()
             )
 
-    logging.basicConfig(handlers=[LoguruHandler()], level=logging.INFO, force=True)
+    logging.basicConfig(handlers=[LoguruHandler(level=logging.WARNING)], level=logging.WARNING, force=True)

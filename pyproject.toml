@@ -8,17 +8,18 @@ authors = [
 ]
 requires-python = ">=3.13"
 dependencies = [
-    "aiogram>=3,<4",
-    "av==18.1.0",
-    "ctranslate2==4.7.2",
-    "faster-whisper>=1.2.1",
     "loguru>=0.7.3",
-    "psycopg[binary]>=3.3.8",
+    "tzdata; sys_platform == 'win32'",
 ]
+
+[project.optional-dependencies]
+postgres = ["psycopg[binary]>=3.3.8"]
+telegram = ["aiogram>=3,<4"]
+worker = ["av==18.1.0", "ctranslate2==4.7.2", "faster-whisper>=1.2.1"]
 
 [project.scripts]
 nova-transcriber = "nova_transcriber.cli:main"
 
 [build-system]
-requires = ["uv_build>=0.12.9,<0.13.0"]
+requires = ["uv_build>=0.12.9,<0.14.0"]
 build-backend = "uv_build"

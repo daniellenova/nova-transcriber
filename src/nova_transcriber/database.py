@@ -8,7 +8,7 @@ from psycopg.rows import dict_row
 
 _TASK_COLUMNS = """t.id, t.model, t.status, t.processing_time, t.created_at,
     t.started_at, t.finished_at, t.error_reason, t.telegram_chat_id, t.telegram_message_id,
-    t.processed_samples, t.total_samples, t.stage, t.file_key,
+    t.processed_samples, t.total_samples, t.stage, t.file_key, t.delete_requested, t.number,
     r.filename, r.source_type, r.file_size, r.duration"""
 
 
@@ -69,8 +69,13 @@ def init_db() -> None:
                 ADD COLUMN IF NOT EXISTS processed_samples BIGINT NOT NULL DEFAULT 0,
                 ADD COLUMN IF NOT EXISTS total_samples BIGINT,
                 ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0,
-                ADD COLUMN IF NOT EXISTS stage TEXT
+                ADD COLUMN IF NOT EXISTS stage TEXT,
+                ADD COLUMN IF NOT EXISTS delete_requested BOOLEAN NOT NULL DEFAULT FALSE,
+                ADD COLUMN IF NOT EXISTS number BIGINT
         """)
+        connection.execute('DROP INDEX IF EXISTS transcriptions_user_number')
+        connection.execute('DROP TABLE IF EXISTS transcription_counters')
+        _renumber(connection)
         connection.execute("""
             CREATE TABLE IF NOT EXISTS transcription_chunks (
                 transcription_id BIGINT NOT NULL REFERENCES transcriptions(id),
@@ -125,6 +130,14 @@ def init_db() -> None:
 INTERRUPTED_REASON = "Обработка прервана из-за остановки или перезапуска сервиса"
 
 
+def _renumber(connection):
+    connection.execute("""WITH numbered AS (
+        SELECT id, row_number() OVER (PARTITION BY user_id ORDER BY created_at, id) AS number
+        FROM transcriptions
+    ) UPDATE transcriptions t SET number = n.number FROM numbered n
+        WHERE t.id = n.id AND t.number IS DISTINCT FROM n.number""")
+
+
 def claim_task(connection):
     # Сеансовая блокировка остаётся после фиксации processing и освобождается
     # PostgreSQL при разрыве соединения. Все записи Worker идут через эту сессию.
@@ -135,7 +148,8 @@ def claim_task(connection):
                 SELECT id, status, file_key, processed_samples, total_samples,
                     retry_count, COALESCE(processing_time, 0) AS processing_time
                 FROM transcriptions
-                WHERE file_key IS NOT NULL AND status IN ('pending', 'processing') AND id > %s
+                WHERE file_key IS NOT NULL AND NOT delete_requested
+                    AND status IN ('pending', 'processing') AND id > %s
                 ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED
             """, (after_id,)).fetchone()
             if row is None:
@@ -214,10 +228,12 @@ def change_task(identifier, user_id, action):
     if action not in {'cancel', 'resume', 'retry'}:
         raise ValueError('Неизвестное действие')
     with _connect() as connection:
-        row = connection.execute('SELECT status, file_key FROM transcriptions WHERE id = %s AND user_id = %s FOR UPDATE',
+        row = connection.execute('SELECT status, file_key, delete_requested FROM transcriptions WHERE id = %s AND user_id = %s FOR UPDATE',
                                  (identifier, user_id)).fetchone()
         if row is None:
             raise ValueError('Задача не найдена')
+        if row['delete_requested']:
+            raise ValueError('Запись уже удаляется')
         if action == 'cancel':
             if row['status'] == 'paused':
                 return
@@ -247,10 +263,48 @@ def history_page(user_id, page):
         page = min(page, pages - 1)
         records = connection.execute(f"""SELECT {_TASK_COLUMNS} FROM transcriptions t
             JOIN recordings r ON r.id = t.recording_id WHERE t.user_id = %s
-            ORDER BY t.created_at DESC, t.id DESC LIMIT 5 OFFSET %s""", (user_id, page * 5)).fetchall()
-        for index, record in enumerate(records):
-            record['number'] = total - page * 5 - index
+            ORDER BY t.number DESC, t.id DESC LIMIT 5 OFFSET %s""", (user_id, page * 5)).fetchall()
         return {'total': total, 'page': page, 'pages': pages, 'items': records}
+
+
+def delete_tasks(user_id, identifiers):
+    if (not isinstance(identifiers, list) or not 1 <= len(identifiers) <= 1000
+            or any(type(value) is not int or not 0 < value <= 9223372036854775807 for value in identifiers)):
+        raise ValueError('Выберите от 1 до 1000 записей с корректными ID')
+    identifiers = sorted(set(identifiers))
+    with _connect() as connection:
+        records = connection.execute('SELECT id, user_id FROM transcriptions WHERE id = ANY(%s) ORDER BY id FOR UPDATE',
+                                     (identifiers,)).fetchall()
+        if any(record['user_id'] != user_id for record in records):
+            raise ValueError('Нельзя удалить чужие записи')
+        connection.execute("""UPDATE transcriptions SET delete_requested = TRUE,
+            delivery_notified = TRUE, stage = NULL,
+            status = CASE WHEN status IN ('pending', 'processing') THEN 'paused' ELSE status END
+            WHERE id = ANY(%s) AND user_id = %s""", (identifiers, user_id))
+    cleanup_deleted_tasks()
+
+
+def cleanup_deleted_tasks():
+    with _connect() as connection:
+        # Создание и удаление не должны одновременно менять пользовательские номера.
+        connection.execute('SELECT pg_advisory_xact_lock(19790520, 2)')
+        records = connection.execute("""SELECT id, recording_id FROM transcriptions
+            WHERE delete_requested ORDER BY id FOR UPDATE SKIP LOCKED""").fetchall()
+        ready = []
+        for record in records:
+            acquired = connection.execute('SELECT pg_try_advisory_xact_lock(%s) AS acquired', (-record['id'],)).fetchone()['acquired']
+            if acquired:
+                ready.append(record)
+        if not ready:
+            return
+        identifiers = [record['id'] for record in ready]
+        recording_ids = [record['recording_id'] for record in ready]
+        connection.execute('DELETE FROM transcription_chunks WHERE transcription_id = ANY(%s)', (identifiers,))
+        connection.execute('DELETE FROM transcriptions WHERE id = ANY(%s)', (identifiers,))
+        _renumber(connection)
+        connection.execute('SELECT id FROM recordings WHERE id = ANY(%s) ORDER BY id FOR UPDATE', (recording_ids,)).fetchall()
+        connection.execute('''DELETE FROM recordings r WHERE r.id = ANY(%s)
+            AND NOT EXISTS (SELECT 1 FROM transcriptions t WHERE t.recording_id = r.id)''', (recording_ids,))
 
 
 def fail_task(connection, identifier, reason, processing_time):
@@ -261,6 +315,7 @@ def fail_task(connection, identifier, reason, processing_time):
 
 def create_task(filename, source_type, file_size, duration, user_id, file_key, metadata=None):
     with _connect() as connection:
+        connection.execute('SELECT pg_advisory_xact_lock(19790520, 2)')
         metadata = metadata or {}
         key = metadata.get('request_key')
         if key:
@@ -273,10 +328,12 @@ def create_task(filename, source_type, file_size, duration, user_id, file_key, m
             VALUES (%s, %s, %s, %s) RETURNING id""",
             (filename, source_type, file_size, duration),
         ).fetchone()
+        number = connection.execute('SELECT COALESCE(max(number), 0) + 1 AS number FROM transcriptions WHERE user_id = %s',
+                                    (user_id,)).fetchone()['number']
         return connection.execute(
-            """INSERT INTO transcriptions (recording_id, model, status, user_id, file_key, request_key, telegram_chat_id, telegram_message_id)
-            VALUES (%s, 'large-v3', 'pending', %s, %s, %s, %s, %s) RETURNING id, status""",
-            (recording["id"], user_id, file_key, key, metadata.get('telegram_chat_id'), metadata.get('telegram_message_id')),
+            """INSERT INTO transcriptions (recording_id, model, status, user_id, file_key, request_key, telegram_chat_id, telegram_message_id, number, created_at)
+            VALUES (%s, 'large-v3', 'pending', %s, %s, %s, %s, %s, %s, clock_timestamp()) RETURNING id, status""",
+            (recording["id"], user_id, file_key, key, metadata.get('telegram_chat_id'), metadata.get('telegram_message_id'), number),
         ).fetchone()
 
 
@@ -286,7 +343,7 @@ def notifications(user_id):
             JOIN recordings r ON r.id=t.recording_id
             WHERE t.user_id=%s AND t.telegram_chat_id IS NOT NULL
             AND NOT (t.file_key IS NULL AND t.status = 'completed')
-            AND NOT t.delivery_notified ORDER BY t.id''', (user_id,)).fetchall()
+            AND NOT t.delivery_notified AND NOT t.delete_requested ORDER BY t.id''', (user_id,)).fetchall()
 
 
 def acknowledge(identifier, user_id):
@@ -351,9 +408,7 @@ def get_transcription(transcription_id: int, user_id: int | None = None, *, incl
     with _connect() as connection:
         return connection.execute(
             f"""
-            SELECT {_TASK_COLUMNS}{text_column},
-                (SELECT count(*) FROM transcriptions n WHERE n.user_id = t.user_id
-                    AND (n.created_at, n.id) <= (t.created_at, t.id)) AS number
+            SELECT {_TASK_COLUMNS}{text_column}
             FROM transcriptions AS t
             JOIN recordings AS r ON r.id = t.recording_id
             WHERE t.id = %s AND t.user_id = %s

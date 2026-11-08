@@ -43,6 +43,18 @@ class Handler(BaseHTTPRequestHandler):
             user_id = get_owner_id()
             url = urlsplit(self.path)
             parts = url.path.strip("/").split("/")
+            if self.command == 'POST' and parts == ['tasks', 'delete']:
+                if self.headers.get('Transfer-Encoding'):
+                    raise ValueError('Неподдерживаемый способ передачи')
+                length = int(self.headers.get('Content-Length', '0'))
+                if not 0 < length <= 32768:
+                    raise ValueError('Недопустимый размер запроса')
+                data = json.loads(self.rfile.read(length))
+                if not isinstance(data, dict):
+                    raise ValueError('Ожидается объект с выбранными ID')
+                database.delete_tasks(user_id, data.get('ids'))
+                self.respond(200, {'ok': True})
+                return
             if self.command == 'GET' and parts == ['history']:
                 page = int(parse_qs(url.query).get('page', ['0'])[0])
                 if not 0 <= page <= 2147483647:

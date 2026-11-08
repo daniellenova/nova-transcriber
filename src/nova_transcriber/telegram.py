@@ -4,11 +4,13 @@ import os
 import math
 import re
 import signal
+import secrets
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from decimal import Decimal
 from pathlib import Path
 from time import perf_counter
+from urllib.error import HTTPError
 
 from nova_transcriber import api_client
 from loguru import logger
@@ -105,7 +107,7 @@ def _recording_summary(record: dict) -> str:
         date = created_at.astimezone(
             ZoneInfo(os.environ.get("DISPLAY_TIMEZONE", "Europe/Moscow"))
         ).strftime("%d.%m.%Y, %H:%M")
-    lines = [f"Запись №{record.get('number') or record['id']}", f"Файл: {filename}", f"Дата: {date}"]
+    lines = [f"Запись №{record['number']}", f"Файл: {filename}", f"Дата: {date}"]
     for key, label in (("duration", "Длительность записи"),
                        ("processing_time", "Время обработки")):
         value = record.get(key)
@@ -117,7 +119,8 @@ def _recording_summary(record: dict) -> str:
         "failed": "Ошибка",
         "paused": "Приостановлена",
     }
-    lines.append(f"Состояние: {statuses.get(record.get('status'), 'Неизвестно')}")
+    state = 'Удаляется' if record.get('deleting') else statuses.get(record.get('status'), 'Неизвестно')
+    lines.append(f"Состояние: {state}")
     if record.get('status') in {'pending', 'processing', 'failed', 'paused'} and record.get('total_samples'):
         lines.append(f"Обработано: {_progress(record)}")
     if record.get("status") == "failed" and record.get("error_reason"):
@@ -160,36 +163,118 @@ def _history_label(record):
     }[record['status']]
     if record['status'] == 'processing' and record.get('total_samples'):
         status += f" · {min(100, record['processed_samples'] * 100 // record['total_samples'])}%"
+    if record.get('deleting'):
+        status = '🗑 Удаляется'
     duration = _duration(record['duration']) if record.get('duration') is not None else 'длительность уточняется'
     return f"№{record['number']}. {_recording_name(record)}\n{status} · {duration}"
 
 
-async def _show_history(message=None, page=0, identifier=None, *, new=False):
+async def _show_history(message=None, page=0, identifier=None, *, new=False, delete_start=False, delete_event=None):
     async with HISTORY_LOCK:
-        if message is None:
+        deletion = None
+        if message is None or delete_event is not None:
             if not HISTORY_PANEL:
+                if delete_event is not None:
+                    raise ValueError('Выбор устарел. Откройте историю заново')
                 return
+            if delete_event is not None:
+                stored = HISTORY_PANEL.get('deletion')
+                previous = HISTORY_PANEL['message']
+                if (not stored or stored['token'] != delete_event[0]
+                        or (message.chat.id, message.message_id) != (previous.chat.id, previous.message_id)):
+                    raise ValueError('Выбор устарел. Откройте историю заново')
             message, page, identifier = (HISTORY_PANEL[key] for key in ('message', 'page', 'identifier'))
+            if HISTORY_PANEL.get('deletion'):
+                deletion = {**HISTORY_PANEL['deletion'], 'selected': set(HISTORY_PANEL['deletion']['selected'])}
+        if delete_start:
+            if identifier is not None:
+                await asyncio.to_thread(api_client.request, f'/tasks/{identifier}')
+            deletion = {'token': secrets.token_hex(4), 'selected': {identifier} if identifier is not None else set(),
+                        'mode': 'confirm' if identifier is not None else 'select', 'origin': identifier, 'allowed': set()}
+        if delete_event is not None:
+            _, action, value = delete_event
+            if action == 'cancel':
+                identifier = deletion['origin']
+                deletion = None
+            elif action == 'commit':
+                if deletion['mode'] != 'confirm' or not deletion['selected']:
+                    raise ValueError('Сначала выберите записи и подтвердите удаление')
+                await asyncio.to_thread(api_client.request, '/tasks/delete', {'ids': sorted(deletion['selected'])})
+                identifier = None
+                deletion = None
+            elif deletion['mode'] != 'select':
+                raise ValueError('Подтвердите удаление или нажмите «Отмена»')
+            elif action == 'page':
+                page = value
+            elif action == 'toggle':
+                if value not in deletion['allowed']:
+                    raise ValueError('Страница изменилась. Выберите запись ещё раз')
+                if value in deletion['selected']:
+                    deletion['selected'].remove(value)
+                else:
+                    if len(deletion['selected']) >= 1000:
+                        raise ValueError('Можно выбрать не более 1000 записей за один раз')
+                    deletion['selected'].add(value)
+            elif action == 'confirm':
+                if not deletion['selected']:
+                    raise ValueError('Сначала выберите записи')
+                deletion['mode'] = 'confirm'
+        record = None
+        if identifier is not None and deletion is None:
+            try:
+                record = await asyncio.to_thread(api_client.request, f'/tasks/{identifier}')
+            except HTTPError as error:
+                if error.code != 404:
+                    raise
+                identifier = None
         rows = []
-        if identifier is None:
+        if deletion is not None and deletion['mode'] == 'confirm':
+            token = deletion['token']
+            title = '🗑 Удалить запись?' if len(deletion['selected']) == 1 else f"🗑 Удалить выбранные записи ({len(deletion['selected'])})?"
+            text = (f'{title}\n\n'
+                    'Записи исчезнут из истории.\nСохранённые тексты и промежуточные части будут удалены.\n\n'
+                    'Исходные аудиофайлы не удаляются. Уже отправленные сообщения и TXT останутся в Telegram.\n\n'
+                    'Активные задачи сначала будут остановлены.\nЭто действие нельзя отменить.')
+            rows.append([InlineKeyboardButton(text='🗑 Да, удалить', callback_data=f'delete:{token}:commit:0'),
+                         InlineKeyboardButton(text='Отмена', callback_data=f'delete:{token}:cancel:0')])
+        elif identifier is None or deletion is not None:
             result = await asyncio.to_thread(api_client.request, f'/history?page={page}')
             page = result['page']
             text = f"История транскрибаций\nЗаписей: {result['total']} · Выберите нужную"
             if not result['total']:
                 text = 'История транскрибаций пока пуста'
-            if result['items']:
+            if deletion is not None:
+                token = deletion['token']
+                available = [r for r in result['items'] if not r.get('deleting')]
+                deletion['allowed'] = {r['id'] for r in available}
+                text = f"🗑 Выберите записи для удаления\nВыбрано: {len(deletion['selected'])}"
+                text += '\n\n' + '\n\n'.join(
+                    f"{'☑' if r['id'] in deletion['selected'] else '☐'} {_history_label(r)}" for r in result['items'])
+                if available:
+                    rows.append([InlineKeyboardButton(
+                        text=f"{'☑ ' if r['id'] in deletion['selected'] else ''}{r['number']}",
+                        callback_data=f"delete:{token}:toggle:{r['id']}") for r in available])
+            elif result['items']:
                 text += '\n\n' + '\n\n'.join(_history_label(record) for record in result['items'])
                 rows.append([InlineKeyboardButton(text=str(record['number']),
                     callback_data=f"history:open:{record['id']}:{page}") for record in result['items']])
             navigation = []
             if page:
-                navigation.append(InlineKeyboardButton(text='Назад', callback_data=f'history:page:{page - 1}'))
+                navigation.append(InlineKeyboardButton(text='Назад', callback_data=(
+                    f'delete:{token}:page:{page - 1}' if deletion is not None else f'history:page:{page - 1}')))
             navigation.append(InlineKeyboardButton(text=f"{page + 1} / {result['pages']}", callback_data='history:noop:0'))
             if page + 1 < result['pages']:
-                navigation.append(InlineKeyboardButton(text='Далее', callback_data=f'history:page:{page + 1}'))
+                navigation.append(InlineKeyboardButton(text='Далее', callback_data=(
+                    f'delete:{token}:page:{page + 1}' if deletion is not None else f'history:page:{page + 1}')))
             rows.append(navigation)
+            if deletion is not None:
+                if deletion['selected']:
+                    rows.append([InlineKeyboardButton(text=f"🗑 Удалить выбранные ({len(deletion['selected'])})",
+                        callback_data=f'delete:{token}:confirm:0')])
+                rows.append([InlineKeyboardButton(text='Отмена', callback_data=f'delete:{token}:cancel:0')])
+            elif result['total']:
+                rows.append([InlineKeyboardButton(text='🗑 Удалить записи', callback_data=f'history:delete:0:{page}')])
         else:
-            record = await asyncio.to_thread(api_client.request, f'/tasks/{identifier}')
             text = _recording_summary(record)
             if record['status'] == 'completed' or record.get('has_partial_result'):
                 rows.append([InlineKeyboardButton(
@@ -198,6 +283,8 @@ async def _show_history(message=None, page=0, identifier=None, *, new=False):
             names = {'cancel': 'Отменить', 'resume': 'Продолжить', 'retry': 'Повторить'}
             for action in record['actions']:
                 rows.append([InlineKeyboardButton(text=names[action], callback_data=f'history:{action}:{identifier}:{page}')])
+            if not record.get('deleting'):
+                rows.append([InlineKeyboardButton(text='🗑 Удалить запись', callback_data=f'history:delete:{identifier}:{page}')])
             rows.append([InlineKeyboardButton(text='К списку', callback_data=f'history:page:{page}')])
         updated_at = datetime.now(timezone.utc).astimezone(
             ZoneInfo(os.environ.get('DISPLAY_TIMEZONE', 'Europe/Moscow'))
@@ -216,7 +303,7 @@ async def _show_history(message=None, page=0, identifier=None, *, new=False):
                     if isinstance(error, TelegramBadRequest):
                         HISTORY_PANEL.clear()
                     raise
-        HISTORY_PANEL.update(message=message, page=page, identifier=identifier, signature=signature)
+        HISTORY_PANEL.update(message=message, page=page, identifier=identifier, signature=signature, deletion=deletion)
 
 
 async def history(message: Message) -> None:
@@ -227,15 +314,38 @@ async def history(message: Message) -> None:
         await message.answer('Не удалось загрузить историю. Попробуйте позже.')
 
 
+async def delete_callback(callback: CallbackQuery) -> None:
+    parts = (callback.data or '').split(':')
+    if (len(parts) != 4 or not re.fullmatch(r'[0-9a-f]{8}', parts[1])
+            or parts[2] not in {'toggle', 'page', 'confirm', 'commit', 'cancel'}
+            or not parts[3].isascii() or not parts[3].isdigit()
+            or not 0 <= int(parts[3]) <= 9223372036854775807
+            or (parts[2] == 'toggle' and int(parts[3]) == 0)
+            or (parts[2] == 'page' and int(parts[3]) > 2147483647)):
+        await callback.answer('Некорректный выбор', show_alert=True)
+        return
+    if not isinstance(callback.message, Message):
+        await callback.answer('Сообщение недоступно', show_alert=True)
+        return
+    await callback.answer()
+    try:
+        await _show_history(callback.message, delete_event=(parts[1], parts[2], int(parts[3])))
+    except ValueError as error:
+        await callback.answer(str(error), show_alert=True)
+    except Exception:
+        logging.getLogger(__name__).exception('Не удалось выполнить удаление')
+        await callback.answer('Не удалось выполнить действие. Попробуйте позже.', show_alert=True)
+
+
 async def history_callback(callback: CallbackQuery) -> None:
     parts = (callback.data or "").split(":")
     if (
         len(parts) not in {3, 4}
-        or parts[1] not in {'txt', 'info', 'page', 'open', 'cancel', 'resume', 'retry', 'noop'}
+        or parts[1] not in {'txt', 'info', 'page', 'open', 'cancel', 'resume', 'retry', 'noop', 'delete'}
         or not parts[2].isascii()
         or not parts[2].isdigit()
         or not 0 <= int(parts[2]) <= 9223372036854775807
-        or (parts[1] not in {'page', 'noop'} and int(parts[2]) == 0)
+        or (parts[1] not in {'page', 'noop', 'delete'} and int(parts[2]) == 0)
         or (parts[1] == 'page' and int(parts[2]) > 2147483647)
         or (len(parts) == 4 and (not parts[3].isascii() or not parts[3].isdigit() or not 0 <= int(parts[3]) <= 2147483647))
     ):
@@ -252,6 +362,9 @@ async def history_callback(callback: CallbackQuery) -> None:
     identifier = int(parts[2])
     page = int(parts[3]) if len(parts) == 4 else 0
     try:
+        if action == 'delete':
+            await _show_history(callback.message, page, identifier or None, delete_start=True)
+            return
         if action == 'page':
             await _show_history(callback.message, identifier)
             return
@@ -451,6 +564,7 @@ async def notifications(bot):
         for record in records:
             try:
                 identifier = record['id']
+                number = record['number']
                 status = record['status']
                 chat = record['telegram_chat_id']
                 async def edit(text):
@@ -461,8 +575,8 @@ async def notifications(bot):
                         return 'message is not modified' in error.message.lower()
                     return True
                 if status in {'pending', 'processing'}:
-                    text = (f'Задача №{identifier}: {_progress(record)}' if status == 'processing'
-                            else f'Задача №{identifier}: ожидает обработки')
+                    text = (f'Задача №{number}: {_progress(record)}' if status == 'processing'
+                            else f'Задача №{number}: ожидает обработки')
                     if previous.get(identifier) != text and perf_counter() - updated_at.get(identifier, 0) >= 15:
                         if await edit(text):
                             previous[identifier] = text
@@ -470,14 +584,14 @@ async def notifications(bot):
                     continue
                 previous.pop(identifier, None)
                 updated_at.pop(identifier, None)
-                final_text = (f'Задача №{identifier}: готово. Результат отправлен.' if status == 'completed'
+                final_text = (f'Задача №{number}: готово. Результат отправлен.' if status == 'completed'
                               else _recording_summary(record))
                 if identifier not in delivered:
                     if status == 'completed':
                         result = await asyncio.to_thread(api_client.request, f'/tasks/{identifier}/result')
-                        await edit(f'Задача №{identifier}: речь распознана. Отправляю результат…')
+                        await edit(f'Задача №{number}: речь распознана. Отправляю результат…')
                         filename = Path(record['filename'].replace('\\', '/')).stem + '.txt'
-                        await bot.send_document(chat, BufferedInputFile(result['text'].encode('utf-8'), filename=filename), caption=f'Задача №{identifier}: завершена. Результат отправлен')
+                        await bot.send_document(chat, BufferedInputFile(result['text'].encode('utf-8'), filename=filename), caption=f'Задача №{number}: завершена. Результат отправлен')
                         delivered.add(identifier)
                     else:
                         if not await edit(final_text):
@@ -511,6 +625,7 @@ async def main() -> None:
     dispatcher.message.register(start, CommandStart())
     dispatcher.message.register(history, Command("history"))
     dispatcher.callback_query.register(history_callback, F.data.startswith("history:"))
+    dispatcher.callback_query.register(delete_callback, F.data.startswith('delete:'))
     dispatcher.message.register(
         receive_file, F.content_type.in_({"voice", "video_note", "audio", "video", "document"})
     )

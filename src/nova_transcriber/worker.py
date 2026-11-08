@@ -128,6 +128,7 @@ def main():
     log.bind(event='ready').info('Обработчик готов к получению задач')
     while not stopping.is_set():
         try:
+            database.cleanup_deleted_tasks()
             with database._connect() as connection:
                 connection.autocommit = True
                 task = database.claim_task(connection)

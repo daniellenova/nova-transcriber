@@ -15,6 +15,7 @@ from nova_transcriber.errors import EmptyFileError, MediaError, UnreadableMediaE
 
 SAMPLE_RATE = 16000
 CHUNK_SAMPLES = 300 * SAMPLE_RATE
+OVERLAP_SAMPLES = 5 * SAMPLE_RATE
 
 
 @cache
@@ -68,25 +69,40 @@ def audio_samples(path) -> int:
 
 
 def _audio_chunks(path, start_sample):
-    buffer = np.empty(CHUNK_SAMPLES, dtype=np.float32)
+    buffer = np.empty(CHUNK_SAMPLES + 2 * OVERLAP_SAMPLES, dtype=np.float32)
+    window_start = max(0, start_sample - OVERLAP_SAMPLES)
+    left_context = start_sample - window_start
+    target = left_context + CHUNK_SAMPLES + OVERLAP_SAMPLES
     used = position = 0
     limit = get_positive_int("MAX_DURATION_SECONDS", 43200) * SAMPLE_RATE
     for samples in _audio_frames(path):
         end = position + len(samples)
         if end > limit:
             raise MediaError("Запись превышает допустимую длительность")
-        offset = min(len(samples), max(0, start_sample - position))
+        offset = min(len(samples), max(0, window_start - position))
         position = end
         while offset < len(samples):
-            count = min(CHUNK_SAMPLES - used, len(samples) - offset)
+            count = min(target - used, len(samples) - offset)
             buffer[used:used + count] = samples[offset:offset + count]
             used += count
             offset += count
-            if used == CHUNK_SAMPLES:
-                yield buffer
-                used = 0
-    if used:
-        yield buffer[:used]
+            if used == target:
+                yield buffer[:used], left_context, CHUNK_SAMPLES
+                retained = 2 * OVERLAP_SAMPLES
+                buffer[:retained] = buffer[used - retained:used].copy()
+                window_start += left_context + CHUNK_SAMPLES - OVERLAP_SAMPLES
+                left_context = OVERLAP_SAMPLES
+                target = len(buffer)
+                used = retained
+    while used > left_context:
+        core_samples = min(CHUNK_SAMPLES, used - left_context)
+        yield buffer[:used], left_context, core_samples
+        if used - left_context <= CHUNK_SAMPLES:
+            break
+        advance = left_context + core_samples - OVERLAP_SAMPLES
+        used -= advance
+        buffer[:used] = buffer[advance:advance + used].copy()
+        left_context = OVERLAP_SAMPLES
 
 
 def transcribe_chunks(path, *, start_sample=0, on_status=None):
@@ -98,16 +114,23 @@ def transcribe_chunks(path, *, start_sample=0, on_status=None):
     model = _get_model()
     status("Чтение аудио")
     position = start_sample
-    for audio in _audio_chunks(path, start_sample):
+    for audio, left_context, core_samples in _audio_chunks(path, start_sample):
         check_disk_space(Path(path).parent)
         status("Распознавание")
         segments, _ = model.transcribe(
             audio, language="ru", task="transcribe", vad_filter=False,
+            word_timestamps=True,
         )
-        text = " ".join(segment.text.strip() for segment in segments).strip()
-        position += len(audio)
+        begin = left_context / SAMPLE_RATE
+        end = (left_context + core_samples) / SAMPLE_RATE
+        # Контекст слышен модели с обеих сторон, но каждое слово принадлежит одной части.
+        text = "".join(
+            word.word for segment in segments for word in segment.words
+            if begin <= (word.start + word.end) / 2 < end
+        ).strip()
+        position += core_samples
         yield position, text
-        del segments
+        del segments, audio
         gc.collect()
         status("Чтение аудио")
 

@@ -98,6 +98,7 @@ def _run_task(connection, task, path, stopping, timeout):
     finally:
         child.close()
         if process.pid is not None:
+            process.join(1)
             if process.is_alive():
                 process.terminate()
             process.join(5)

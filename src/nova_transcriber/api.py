@@ -78,10 +78,11 @@ class Handler(BaseHTTPRequestHandler):
                 if record is None:
                     self.respond(404, {"detail": "Задача не найдена"})
                 elif len(parts) == 3:
-                    if record["status"] != "completed" or record["text"] is None:
+                    if record['text'] is None or (record["status"] != "completed" and record["processed_samples"] == 0):
                         self.respond(409, {"detail": "Результат ещё не готов"})
                     else:
-                        self.respond(200, {"id": identifier, "text": record["text"]})
+                        self.respond(200, {**core.api_record(record), "text": record["text"],
+                                           "partial": record["status"] != "completed"})
                 else:
                     self.respond(200, core.api_record(record))
                 return

@@ -20,7 +20,8 @@ def api_record(record):
     fields = ("id", "filename", "source_type", "file_size", "duration", "model",
               "created_at", "started_at", "finished_at", "processing_time", "error_reason", "status",
               "processed_samples", "total_samples", "stage")
-    return {key: record[key] for key in fields}
+    return {**{key: record[key] for key in fields},
+            "has_partial_result": record["status"] != "completed" and record["processed_samples"] > 0}
 
 
 def create_api_task(data, user_id):

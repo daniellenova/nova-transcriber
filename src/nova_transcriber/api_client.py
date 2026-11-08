@@ -33,6 +33,6 @@ def request(path, data=None):
 
 def record(identifier):
     result = request(f'/tasks/{identifier}')
-    if result['status'] == 'completed':
+    if result['status'] == 'completed' or result.get('has_partial_result'):
         result.update(request(f'/tasks/{identifier}/result'))
     return result

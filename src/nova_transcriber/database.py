@@ -291,10 +291,14 @@ def get_recent_transcriptions(limit: int = 10, user_id: int | None = None) -> li
 
 
 def get_transcription(transcription_id: int, user_id: int | None = None, *, include_text=False) -> dict[str, Any] | None:
+    text_column = """, CASE WHEN t.status = 'completed' THEN t.text ELSE COALESCE((
+        SELECT string_agg(c.text, ' ' ORDER BY c.start_sample) FILTER (WHERE c.text <> '')
+        FROM transcription_chunks c WHERE c.transcription_id = t.id
+    ), '') END AS text""" if include_text else ''
     with _connect() as connection:
         return connection.execute(
             f"""
-            SELECT {_TASK_COLUMNS}{', t.text' if include_text else ''}
+            SELECT {_TASK_COLUMNS}{text_column}
             FROM transcriptions AS t
             JOIN recordings AS r ON r.id = t.recording_id
             WHERE t.id = %s AND t.user_id = %s

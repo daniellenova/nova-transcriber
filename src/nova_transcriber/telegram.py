@@ -66,6 +66,14 @@ def _progress(record: dict) -> str:
     return f'{percent}% · {_duration(processed / 16000)} из {_duration(total / 16000)}'
 
 
+def _partial_keyboard(record):
+    if not record.get('has_partial_result'):
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text='Скачать неполный TXT', callback_data=f"history:txt:{record['id']}"),
+    ]])
+
+
 def _recording_summary(record: dict) -> str:
     names = {
         "voice": "Голосовое сообщение", "video_note": "Видеосообщение",
@@ -151,7 +159,8 @@ async def history(message: Message) -> None:
     for record in records:
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(
-                text="Скачать TXT", callback_data=f"history:txt:{record['id']}"
+                text="Скачать TXT" if record['status'] == 'completed' else 'Скачать неполный TXT',
+                callback_data=f"history:txt:{record['id']}"
             ),
             InlineKeyboardButton(
                 text="Информация", callback_data=f"history:info:{record['id']}"
@@ -159,7 +168,7 @@ async def history(message: Message) -> None:
         ]])
         await message.answer(
             _recording_summary(record), parse_mode=None,
-            reply_markup=keyboard if record["status"] == "completed" else None,
+            reply_markup=keyboard if record["status"] == "completed" or record.get('has_partial_result') else None,
         )
 
 
@@ -185,15 +194,21 @@ async def history_callback(callback: CallbackQuery) -> None:
         logging.getLogger(__name__).exception("Не удалось получить транскрибацию")
         await callback.message.answer("Не удалось загрузить результат. Попробуйте позже.")
         return
-    if record["status"] != "completed" or record["text"] is None:
-        await callback.message.answer("Готовый результат не найден.")
+    if record.get("text") is None:
+        await callback.message.answer("Сохранённых частей пока нет.")
         return
 
     if parts[1] == "txt":
         output_name = Path(record["filename"].replace("\\", "/")).stem + ".txt"
+        text = record['text']
+        partial = record.get('partial', False)
+        if partial:
+            output_name = Path(output_name).stem + '_неполный.txt'
+            text = f"Неполный результат\nОбработано: {_progress(record)}\n\n{text}"
         try:
             await callback.message.answer_document(
-                BufferedInputFile(record["text"].encode("utf-8"), filename=output_name)
+                BufferedInputFile(text.encode("utf-8"), filename=output_name),
+                caption='Неполный результат' if partial else None,
             )
         except TelegramAPIError:
             await callback.message.answer("Не удалось отправить TXT. Попробуйте позже.")
@@ -368,7 +383,8 @@ async def notifications(bot):
                 chat = record['telegram_chat_id']
                 async def edit(text):
                     try:
-                        await bot.edit_message_text(text, chat_id=chat, message_id=record['telegram_message_id'])
+                        await bot.edit_message_text(text, chat_id=chat, message_id=record['telegram_message_id'],
+                                                    reply_markup=_partial_keyboard(record))
                     except TelegramAPIError as error:
                         return 'message is not modified' in error.message.lower()
                     return True
@@ -393,7 +409,7 @@ async def notifications(bot):
                         delivered.add(identifier)
                     else:
                         if not await edit(final_text):
-                            await bot.send_message(chat, final_text)
+                            await bot.send_message(chat, final_text, reply_markup=_partial_keyboard(record))
                         delivered.add(identifier)
                 if status == 'completed' and not await edit(final_text):
                     await bot.send_message(chat, final_text)

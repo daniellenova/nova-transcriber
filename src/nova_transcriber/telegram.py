@@ -3,15 +3,20 @@ import logging
 import os
 import math
 import re
+import signal
 from datetime import timezone
 from zoneinfo import ZoneInfo
 from decimal import Decimal, DecimalException
 from pathlib import Path
+from time import perf_counter
+
+import psycopg
+from loguru import logger
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramNetworkError
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     BufferedInputFile,
@@ -104,6 +109,7 @@ def _recording_summary(record: dict) -> str:
             "Ошибка распознавания аудио или видео",
             "Обработка отменена до начала распознавания",
             "Обработка прервана до начала распознавания",
+            database.INTERRUPTED_REASON,
         }
         reasons = {
             "Не удалось сохранить результат в PostgreSQL": "Не удалось сохранить результат",
@@ -189,6 +195,20 @@ async def history_callback(callback: CallbackQuery) -> None:
 async def receive_file(
     message: Message, bot: Bot, max_file_size_mb: Decimal = Decimal("100")
 ) -> None:
+    log = logger.bind(component=f"Telegram, сообщение №{message.message_id}")
+    received_at = perf_counter()
+    log.bind(event="file_received").info("Получено сообщение с медиафайлом")
+    try:
+        status_message = await message.answer(
+            "Получено сообщение с файлом. Загружаю файл для обработки…"
+        )
+    except TelegramAPIError as error:
+        log.bind(event="file_ack_failed", duration=f"{perf_counter() - received_at:.3f} с",
+                 error=error.message).error("Не удалось отправить подтверждение получения файла")
+        raise
+    log.bind(event="file_ack_sent", duration=f"{perf_counter() - received_at:.3f} с").info(
+        "Отправлено подтверждение получения файла"
+    )
     source_type = message.content_type
     media = getattr(message, source_type)
     max_file_size = max_file_size_mb * 1_048_576
@@ -197,43 +217,99 @@ async def receive_file(
     )
     metadata_size = getattr(media, "file_size", None)
     if isinstance(metadata_size, int) and metadata_size > max_file_size:
-        await message.answer(too_large_message)
+        await status_message.edit_text(too_large_message)
         return
 
+    stage = "Запрос getFile"
+    stage_started = perf_counter()
     try:
-        file = await bot.get_file(media.file_id)
+        log.bind(event="file_download_started").info(
+            "Начат запрос getFile; размер по данным Telegram: {} байт; "
+            "тайм-аут всего HTTP-запроса: 600 с", metadata_size if metadata_size is not None else "неизвестен"
+        )
+        file = await bot.get_file(media.file_id, request_timeout=600)
+        log.bind(event="get_file_completed", duration=f"{perf_counter() - stage_started:.3f} с").info(
+            "Получен ответ getFile"
+        )
+        stage = "Проверка локального пути"
+        stage_started = perf_counter()
         if not file.file_path:
             raise ValueError("Bot API не вернул путь файла")
         path = Path(file.file_path)
         if not path.is_absolute():
             raise ValueError("Bot API не вернул локальный абсолютный путь")
         path = path.resolve()
-        if not path.is_relative_to(FILE_ROOT) or not path.is_file():
+        if not path.is_relative_to(FILE_ROOT):
+            raise ValueError("Путь файла находится вне общего каталога")
+        log.bind(event="file_path_checked", duration=f"{perf_counter() - stage_started:.3f} с").info(
+            "Локальный путь находится в общем каталоге"
+        )
+        stage = "Проверка доступности файла"
+        stage_started = perf_counter()
+        if not path.is_file():
             raise ValueError("Локальный файл недоступен в общем каталоге")
+        log.bind(event="file_availability_checked", duration=f"{perf_counter() - stage_started:.3f} с").info(
+            "Файл существует; доступ для чтения: {}", "да" if os.access(path, os.R_OK) else "нет"
+        )
+        stage = "Получение размера файла"
+        stage_started = perf_counter()
         filename = getattr(media, "file_name", None) or {
             "voice": "Голосовое сообщение", "video_note": "Видеосообщение",
             "audio": "Аудиозапись", "video": "Видеозапись",
         }.get(source_type, path.name)
         file_size = path.stat().st_size
-    except (TelegramAPIError, OSError, ValueError):
-        await message.answer(
-            "Не удалось получить доступ к файлу. Проверьте локальный Bot API "
-            "и подключение общего каталога файлов."
+        log.bind(event="file_size_read", duration=f"{perf_counter() - stage_started:.3f} с").info(
+            "Получен размер локального файла: {} байт", file_size
+        )
+    except TelegramNetworkError as error:
+        timed_out = isinstance(error.__cause__, asyncio.TimeoutError)
+        reason = ("Истекло время ожидания загрузки файла из Telegram"
+                  if timed_out else "Нарушено соединение с локальным Telegram Bot API")
+        log.bind(event="file_download_failed", duration=f"{perf_counter() - stage_started:.3f} с",
+                 error=error.message).error("Этап «{}»: {}", stage, reason)
+        await status_message.edit_text(
+            f"{reason}. Не удалось получить файл для обработки. Попробуйте отправить его ещё раз."
+        )
+        return
+    except TelegramAPIError as error:
+        log.bind(event="file_download_failed", duration=f"{perf_counter() - stage_started:.3f} с",
+                 error=error.message).error(
+            "Этап «{}»: Telegram Bot API отклонил запрос на получение файла", stage
+        )
+        await status_message.edit_text(
+            "Telegram не смог предоставить файл для обработки. Попробуйте отправить его ещё раз."
+        )
+        return
+    except (OSError, ValueError) as error:
+        reason = (str(error) if isinstance(error, ValueError)
+                  else f"Ошибка доступа к локальному файлу, код: {error.errno}")
+        log.bind(event="file_access_failed", duration=f"{perf_counter() - stage_started:.3f} с").error(
+            "Этап «{}»: {}", stage, reason
+        )
+        await status_message.edit_text(
+            "Файл получен из Telegram, но недоступен для чтения. "
+            "Проверьте подключение общего каталога файлов локального Bot API."
         )
         return
 
+    log.bind(event="file_download_completed", duration=f"{perf_counter() - received_at:.3f} с").info(
+        "Файл получен и доступен для обработки; общее время с получения сообщения"
+    )
     if file_size > max_file_size:
-        await message.answer(too_large_message)
+        await status_message.edit_text(too_large_message)
         return
 
     task_id = None
-    status_message = None
 
     async def update_status(identifier: int, status: str) -> None:
         nonlocal task_id, status_message
         task_id = identifier
+        if status == "pending":
+            await asyncio.to_thread(
+                database.save_status_message, identifier, message.chat.id, status_message.message_id
+            )
         text = (f"Файл получен. Задача №{identifier} создана. Ожидает обработки"
-                if status == "pending" else f"Задача №{identifier}: обрабатывается")
+                if status == "pending" else f"Задача №{identifier}: распознаю речь…")
         try:
             if status_message is None:
                 status_message = await message.answer(text)
@@ -272,6 +348,11 @@ async def receive_file(
         await report_error("Не удалось обработать файл. Попробуйте повторить позже.")
         return
 
+    try:
+        await status_message.edit_text(f"Задача №{task_id}: речь распознана. Отправляю результат…")
+    except TelegramAPIError:
+        task_log(task_id, "notification_failed", "Не удалось обновить сообщение о состоянии",
+                 error="Ошибка отправки сообщения Telegram")
     output_name = Path(filename.replace("\\", "/")).stem + ".txt"
     try:
         await message.answer_document(
@@ -279,17 +360,48 @@ async def receive_file(
             caption=f"Задача №{task_id}: завершена. Результат отправлен",
         )
         task_log(task_id, "txt_sent", "Результат отправлен пользователю")
+        final_status = f"Задача №{task_id}: готово. Результат отправлен."
     except TelegramAPIError:
         task_log(task_id, "txt_send_failed", "Результат сохранён, но TXT не отправлен",
                  error="Ошибка отправки документа Telegram")
-        await message.answer(
-            f"Задача №{task_id}: завершена. Текст сохранён в базе, но отправить TXT не удалось."
+        final_status = (
+            f"Задача №{task_id}: речь распознана, но отправить TXT не удалось. "
+            "Результат сохранён и доступен через /history."
         )
     if status_message is not None:
         try:
-            await status_message.edit_text(f"Задача №{task_id}: завершена")
+            await status_message.edit_text(final_status)
         except TelegramAPIError:
-            pass
+            await message.answer(final_status)
+
+
+async def notify_interrupted(bot: Bot, user_id: int) -> None:
+    records = await asyncio.to_thread(database.get_interrupted_notifications, user_id)
+    for record in records:
+        identifier = record["id"]
+        text = (
+            f"Задача №{identifier}: ошибка. {database.INTERRUPTED_REASON}. "
+            "Распознавание остановлено. Для повторной обработки отправьте файл ещё раз."
+        )
+        chat_id = record["telegram_chat_id"] or record["user_id"]
+        if record["telegram_message_id"] is not None:
+            try:
+                await bot.edit_message_text(
+                    text, chat_id=chat_id, message_id=record["telegram_message_id"], parse_mode=None
+                )
+            except TelegramAPIError:
+                task_log(identifier, "status_edit_failed", "Не удалось обновить прежнее сообщение",
+                         error="Будет отправлено отдельное уведомление о прерывании")
+        try:
+            # Отдельное сообщение уведомляет пользователя, даже если он не открыл старый статус.
+            await bot.send_message(chat_id, text, parse_mode=None)
+        except TelegramAPIError:
+            task_log(identifier, "interruption_notification_failed",
+                     "Не удалось сообщить о прерывании; отправка будет повторена",
+                     error="Ошибка отправки сообщения Telegram")
+            continue
+        await asyncio.to_thread(database.mark_interruption_notified, identifier)
+        task_log(identifier, "interruption_notified", "Пользователь уведомлён о прерывании обработки")
 
 
 async def main() -> None:
@@ -301,7 +413,33 @@ async def main() -> None:
     if allowed_user_id <= 0:
         raise ValueError("TELEGRAM_ALLOWED_USER_ID должен быть положительным")
 
-    await asyncio.to_thread(database.init_db)
+    async def recover() -> None:
+        logger.bind(event="recovery_started").info("Запущена проверка незавершённых задач")
+        identifiers = await asyncio.to_thread(database.recover_transcriptions, allowed_user_id)
+        for identifier in identifiers:
+            logger.bind(task_id=identifier, event="interrupted").warning(
+                "Задача прервана остановкой сервиса"
+            )
+            task_log(identifier, "recovered", "Задача переведена в состояние «Ошибка»")
+        logger.bind(event="recovery_completed").info(
+            "Проверка завершена. Восстановлено состояний: {}", len(identifiers)
+        )
+
+    for attempt in range(1, 11):
+        try:
+            await asyncio.to_thread(database.init_db)
+            await recover()
+            break
+        except psycopg.OperationalError:
+            if attempt == 10:
+                logger.bind(event="database_unavailable").error(
+                    "Не удалось подключиться к PostgreSQL после 10 попыток. Сервис остановлен"
+                )
+                raise SystemExit(1) from None
+            logger.bind(event="database_retry").warning(
+                "PostgreSQL недоступен. Попытка {} из 10; повтор через 2 секунды", attempt
+            )
+            await asyncio.sleep(2)
 
     dispatcher = Dispatcher()
     dispatcher["max_file_size_mb"] = max_file_size_mb
@@ -317,8 +455,61 @@ async def main() -> None:
     session = AiohttpSession(
         api=TelegramAPIServer.from_base("http://telegram-bot-api:8081", is_local=True)
     )
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def request_stop() -> None:
+        if not stop_event.is_set():
+            logger.bind(event="stop_signal").info("Получен сигнал остановки приложения")
+            core.stop_accepting()
+            stop_event.set()
+
+    for stop_signal in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(stop_signal, request_stop)
+
     async with Bot(token=token, session=session) as bot:
-        await dispatcher.start_polling(bot, allowed_updates=["message", "callback_query"])
+        async def notifications() -> None:
+            while True:
+                try:
+                    await notify_interrupted(bot, allowed_user_id)
+                except psycopg.Error:
+                    logger.bind(event="notification_database_error").error(
+                        "Не удалось прочитать или сохранить уведомления о прерывании; повтор через 30 секунд"
+                    )
+                await asyncio.sleep(30)
+
+        notification_task = asyncio.create_task(notifications())
+        polling = asyncio.create_task(dispatcher.start_polling(
+            bot, allowed_updates=["message", "callback_query"],
+            handle_signals=False, close_bot_session=False,
+        ))
+        stopping = asyncio.create_task(stop_event.wait())
+        logger.bind(event="ready").info("Сервис готов к приёму новых файлов")
+        try:
+            await asyncio.wait((polling, stopping), return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            core.stop_accepting()
+            logger.bind(event="shutdown_started").info("Выполняется завершение работы")
+            polling.cancel()
+            stopping.cancel()
+            notification_task.cancel()
+            await asyncio.gather(polling, stopping, notification_task, return_exceptions=True)
+            await core.wait_for_processing()
+            try:
+                await recover()
+                try:
+                    await asyncio.wait_for(notify_interrupted(bot, allowed_user_id), timeout=3)
+                except asyncio.TimeoutError:
+                    logger.bind(event="shutdown_notification_timeout").warning(
+                        "Не все уведомления отправлены при остановке; отправка продолжится после запуска"
+                    )
+            except psycopg.Error:
+                logger.bind(event="shutdown_database_error").error(
+                    "Не удалось обновить задачи при остановке. Восстановление выполнится при следующем запуске"
+                )
+            logger.bind(event="shutdown_completed").info("Завершение работы выполнено")
+        if not polling.cancelled():
+            polling.result()
 
 
 if __name__ == "__main__":

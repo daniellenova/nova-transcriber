@@ -14,6 +14,7 @@ def _connect() -> psycopg.Connection:
         password=os.environ["PGPASSWORD"],
         row_factory=dict_row,
         options="-c timezone=UTC",
+        connect_timeout=5,
     )
 
 
@@ -46,7 +47,10 @@ def init_db() -> None:
                 ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ,
                 ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ,
                 ADD COLUMN IF NOT EXISTS error_reason TEXT,
-                ADD COLUMN IF NOT EXISTS user_id BIGINT
+                ADD COLUMN IF NOT EXISTS user_id BIGINT,
+                ADD COLUMN IF NOT EXISTS telegram_chat_id BIGINT,
+                ADD COLUMN IF NOT EXISTS telegram_message_id BIGINT,
+                ADD COLUMN IF NOT EXISTS interruption_notified BOOLEAN NOT NULL DEFAULT FALSE
         """)
         connection.execute("""
             ALTER TABLE transcriptions
@@ -87,6 +91,50 @@ def init_db() -> None:
             BEFORE UPDATE ON transcriptions FOR EACH ROW
             EXECUTE FUNCTION guard_transcription_status()
         """)
+
+
+INTERRUPTED_REASON = "Обработка прервана из-за остановки или перезапуска сервиса"
+
+
+def recover_transcriptions(user_id: int) -> list[int]:
+    with _connect() as connection:
+        rows = connection.execute(
+            """
+            UPDATE transcriptions SET status = 'failed',
+                finished_at = clock_timestamp(), error_reason = %s, text = NULL
+            WHERE user_id = %s AND status IN ('pending', 'processing')
+            RETURNING id
+            """,
+            (INTERRUPTED_REASON, user_id),
+        ).fetchall()
+    return [row["id"] for row in rows]
+
+
+def save_status_message(transcription_id: int, chat_id: int, message_id: int) -> None:
+    with _connect() as connection:
+        connection.execute(
+            """UPDATE transcriptions SET telegram_chat_id = %s, telegram_message_id = %s
+            WHERE id = %s""", (chat_id, message_id, transcription_id),
+        )
+
+
+def get_interrupted_notifications(user_id: int) -> list[dict[str, Any]]:
+    with _connect() as connection:
+        return connection.execute(
+            """SELECT id, user_id, telegram_chat_id, telegram_message_id
+            FROM transcriptions
+            WHERE user_id = %s AND status = 'failed' AND error_reason = %s
+                AND NOT interruption_notified
+            ORDER BY id""", (user_id, INTERRUPTED_REASON),
+        ).fetchall()
+
+
+def mark_interruption_notified(transcription_id: int) -> None:
+    with _connect() as connection:
+        connection.execute(
+            "UPDATE transcriptions SET interruption_notified = TRUE WHERE id = %s",
+            (transcription_id,),
+        )
 
 
 def create_recording(

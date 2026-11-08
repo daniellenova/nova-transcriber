@@ -57,8 +57,10 @@ def _run_task(connection, task, path, stopping, timeout):
         child.close()
         while not stopping.is_set():
             now = perf_counter()
-            if now - heartbeat >= 5:
-                connection.execute('SELECT 1')
+            if now - heartbeat >= 1:
+                state = connection.execute('SELECT status FROM transcriptions WHERE id = %s', (identifier,)).fetchone()
+                if state['status'] != 'processing':
+                    return None, False, elapsed()
                 heartbeat = now
             if now - stage_started > timeout:
                 return f'Превышено время этапа «{stage}»', True, elapsed()
@@ -73,9 +75,10 @@ def _run_task(connection, task, path, stopping, timeout):
             if message[0] == 'stage':
                 stage = message[1]
                 stage_started = perf_counter()
-                connection.execute('UPDATE transcriptions SET stage = %s WHERE id = %s', (stage, identifier))
+                connection.execute("UPDATE transcriptions SET stage = %s WHERE id = %s AND status = 'processing'", (stage, identifier))
             elif message[0] == 'duration':
-                database.set_audio_duration(connection, identifier, message[1])
+                if not database.set_audio_duration(connection, identifier, message[1]):
+                    return None, False, elapsed()
                 task['total_samples'] = message[1]
                 parent.send(True)
                 stage_started = perf_counter()
@@ -83,7 +86,8 @@ def _run_task(connection, task, path, stopping, timeout):
                 end_sample, text = message[1:]
                 if not task['processed_samples'] < end_sample <= task['total_samples']:
                     return 'Длительность исходного файла изменилась', False, elapsed()
-                database.save_chunk(connection, identifier, task['processed_samples'], end_sample, text, elapsed())
+                if not database.save_chunk(connection, identifier, task['processed_samples'], end_sample, text, elapsed()):
+                    return None, False, elapsed()
                 task['processed_samples'] = end_sample
                 parent.send(True)
                 stage_started = perf_counter()
@@ -148,6 +152,11 @@ def main():
                     continue
                 while not stopping.is_set():
                     reason, retryable, elapsed = _run_task(connection, task, path, stopping, timeout)
+                    state = connection.execute('SELECT status FROM transcriptions WHERE id = %s', (identifier,)).fetchone()['status']
+                    if state == 'paused':
+                        connection.execute("UPDATE transcriptions SET processing_time = %s WHERE id = %s AND status = 'paused'", (elapsed, identifier))
+                        task_log.bind(event='paused').info('Обработка остановлена пользователем; сохранённые части оставлены')
+                        break
                     if stopping.is_set():
                         connection.execute("""UPDATE transcriptions SET processing_time = %s,
                             status = 'pending', stage = NULL WHERE id = %s AND status = 'processing'""",

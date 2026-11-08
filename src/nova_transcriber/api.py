@@ -43,6 +43,21 @@ class Handler(BaseHTTPRequestHandler):
             user_id = get_owner_id()
             url = urlsplit(self.path)
             parts = url.path.strip("/").split("/")
+            if self.command == 'GET' and parts == ['history']:
+                page = int(parse_qs(url.query).get('page', ['0'])[0])
+                if not 0 <= page <= 2147483647:
+                    raise ValueError('Недопустимая страница')
+                result = database.history_page(user_id, page)
+                result['items'] = [core.api_record(r) for r in result['items']]
+                self.respond(200, result)
+                return
+            if self.command == 'POST' and len(parts) == 3 and parts[0] == 'tasks' and parts[2] in {'cancel', 'resume', 'retry'}:
+                identifier = int(parts[1])
+                if not 0 < identifier <= 9223372036854775807:
+                    raise ValueError('Недопустимый идентификатор')
+                database.change_task(identifier, user_id, parts[2])
+                self.respond(200, {'ok': True})
+                return
             if self.command == 'GET' and parts == ['notifications']:
                 records = database.notifications(user_id)
                 self.respond(200, [{**core.api_record(r), 'telegram_chat_id': r['telegram_chat_id'], 'telegram_message_id': r['telegram_message_id']} for r in records])

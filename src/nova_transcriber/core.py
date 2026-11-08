@@ -21,6 +21,10 @@ def api_record(record):
               "created_at", "started_at", "finished_at", "processing_time", "error_reason", "status",
               "processed_samples", "total_samples", "stage")
     return {**{key: record[key] for key in fields},
+            "number": record.get('number'),
+            "actions": (['cancel'] if record['status'] in {'pending', 'processing'} else
+                        ['retry'] if record['status'] == 'failed' and record.get('file_key') else
+                        ['resume'] if record['status'] == 'paused' and record.get('file_key') else []),
             "has_partial_result": record["status"] != "completed" and record["processed_samples"] > 0}
 
 

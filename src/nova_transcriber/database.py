@@ -8,7 +8,7 @@ from psycopg.rows import dict_row
 
 _TASK_COLUMNS = """t.id, t.model, t.status, t.processing_time, t.created_at,
     t.started_at, t.finished_at, t.error_reason, t.telegram_chat_id, t.telegram_message_id,
-    t.processed_samples, t.total_samples, t.stage,
+    t.processed_samples, t.total_samples, t.stage, t.file_key,
     r.filename, r.source_type, r.file_size, r.duration"""
 
 
@@ -91,7 +91,7 @@ def init_db() -> None:
         """)
         connection.execute("""
             ALTER TABLE transcriptions ADD CONSTRAINT transcriptions_status_check
-                CHECK (status IN ('pending', 'processing', 'completed', 'failed'))
+                CHECK (status IN ('pending', 'processing', 'completed', 'failed', 'paused'))
         """)
         connection.execute("""
             CREATE OR REPLACE FUNCTION guard_transcription_status() RETURNS trigger
@@ -101,8 +101,9 @@ def init_db() -> None:
                     RAISE EXCEPTION 'Идентификатор задачи нельзя изменить';
                 END IF;
                 IF NEW.status IS DISTINCT FROM OLD.status AND NOT (
-                    (OLD.status = 'pending' AND NEW.status IN ('processing', 'failed')) OR
-                    (OLD.status = 'processing' AND NEW.status IN ('pending', 'completed', 'failed'))
+                    (OLD.status = 'pending' AND NEW.status IN ('processing', 'failed', 'paused')) OR
+                    (OLD.status = 'processing' AND NEW.status IN ('pending', 'completed', 'failed', 'paused')) OR
+                    (OLD.status IN ('paused', 'failed') AND NEW.status = 'pending')
                 ) THEN
                     RAISE EXCEPTION 'Недопустимый переход состояния задачи';
                 END IF;
@@ -168,25 +169,33 @@ def claim_task(connection):
 
 def set_audio_duration(connection, identifier, total_samples):
     with connection.transaction():
+        if connection.execute('SELECT status FROM transcriptions WHERE id = %s FOR UPDATE', (identifier,)).fetchone()['status'] != 'processing':
+            return False
         connection.execute("""UPDATE transcriptions SET total_samples = %s,
             retry_count = 0 WHERE id = %s""", (total_samples, identifier))
         connection.execute("""UPDATE recordings SET duration = %s WHERE id =
             (SELECT recording_id FROM transcriptions WHERE id = %s)""",
             (total_samples / 16000, identifier))
+        return True
 
 
 def save_chunk(connection, identifier, start_sample, end_sample, text, processing_time):
     with connection.transaction():
+        if connection.execute('SELECT status FROM transcriptions WHERE id = %s FOR UPDATE', (identifier,)).fetchone()['status'] != 'processing':
+            return False
         connection.execute("""INSERT INTO transcription_chunks
             (transcription_id, start_sample, end_sample, text) VALUES (%s, %s, %s, %s)""",
             (identifier, start_sample, end_sample, text))
         connection.execute("""UPDATE transcriptions SET processed_samples = %s,
             processing_time = %s, retry_count = 0 WHERE id = %s AND status = 'processing'""",
             (end_sample, processing_time, identifier))
+        return True
 
 
 def finish_chunks(connection, identifier, processing_time):
     with connection.transaction():
+        if connection.execute('SELECT status FROM transcriptions WHERE id = %s FOR UPDATE', (identifier,)).fetchone()['status'] != 'processing':
+            return False
         cursor = connection.execute("""UPDATE transcriptions SET
             text = (SELECT COALESCE(string_agg(text, ' ' ORDER BY start_sample)
                 FILTER (WHERE text <> ''), '') FROM transcription_chunks
@@ -198,6 +207,50 @@ def finish_chunks(connection, identifier, processing_time):
         if cursor.rowcount != 1:
             raise ValueError("Не все фрагменты сохранены")
         connection.execute("DELETE FROM transcription_chunks WHERE transcription_id = %s", (identifier,))
+        return True
+
+
+def change_task(identifier, user_id, action):
+    if action not in {'cancel', 'resume', 'retry'}:
+        raise ValueError('Неизвестное действие')
+    with _connect() as connection:
+        row = connection.execute('SELECT status, file_key FROM transcriptions WHERE id = %s AND user_id = %s FOR UPDATE',
+                                 (identifier, user_id)).fetchone()
+        if row is None:
+            raise ValueError('Задача не найдена')
+        if action == 'cancel':
+            if row['status'] == 'paused':
+                return
+            if row['status'] not in {'pending', 'processing'}:
+                raise ValueError('Задача уже завершена. Обновите карточку')
+            connection.execute("""UPDATE transcriptions SET status = 'paused', stage = NULL,
+                delivery_notified = FALSE WHERE id = %s""", (identifier,))
+            return
+        expected = 'failed' if action == 'retry' else 'paused'
+        if row['status'] != expected:
+            raise ValueError('Состояние задачи изменилось. Обновите карточку')
+        if not row['file_key']:
+            raise ValueError('Исходный файл недоступен. Отправьте запись заново')
+        acquired = connection.execute('SELECT pg_try_advisory_xact_lock(%s) AS acquired', (-identifier,)).fetchone()['acquired']
+        if not acquired:
+            raise ValueError('Обработчик ещё останавливается. Повторите через несколько секунд')
+        connection.execute("""UPDATE transcriptions SET status = 'pending', retry_count = 0,
+            error_reason = NULL, finished_at = NULL, stage = NULL, delivery_notified = FALSE
+            WHERE id = %s""", (identifier,))
+
+
+def history_page(user_id, page):
+    with _connect() as connection:
+        connection.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
+        total = connection.execute('SELECT count(*) AS total FROM transcriptions WHERE user_id = %s', (user_id,)).fetchone()['total']
+        pages = max(1, (total + 4) // 5)
+        page = min(page, pages - 1)
+        records = connection.execute(f"""SELECT {_TASK_COLUMNS} FROM transcriptions t
+            JOIN recordings r ON r.id = t.recording_id WHERE t.user_id = %s
+            ORDER BY t.created_at DESC, t.id DESC LIMIT 5 OFFSET %s""", (user_id, page * 5)).fetchall()
+        for index, record in enumerate(records):
+            record['number'] = total - page * 5 - index
+        return {'total': total, 'page': page, 'pages': pages, 'items': records}
 
 
 def fail_task(connection, identifier, reason, processing_time):
@@ -238,7 +291,7 @@ def notifications(user_id):
 
 def acknowledge(identifier, user_id):
     with _connect() as connection:
-        connection.execute("UPDATE transcriptions SET delivery_notified=TRUE WHERE id=%s AND user_id=%s AND status IN ('completed','failed')", (identifier, user_id))
+        connection.execute("UPDATE transcriptions SET delivery_notified=TRUE WHERE id=%s AND user_id=%s AND status IN ('completed','failed','paused')", (identifier, user_id))
 
 
 def complete_transcription(
@@ -298,7 +351,9 @@ def get_transcription(transcription_id: int, user_id: int | None = None, *, incl
     with _connect() as connection:
         return connection.execute(
             f"""
-            SELECT {_TASK_COLUMNS}{text_column}
+            SELECT {_TASK_COLUMNS}{text_column},
+                (SELECT count(*) FROM transcriptions n WHERE n.user_id = t.user_id
+                    AND (n.created_at, n.id) <= (t.created_at, t.id)) AS number
             FROM transcriptions AS t
             JOIN recordings AS r ON r.id = t.recording_id
             WHERE t.id = %s AND t.user_id = %s

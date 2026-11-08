@@ -16,7 +16,7 @@ from loguru import logger
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
-from aiogram.exceptions import TelegramAPIError, TelegramNetworkError, TelegramRetryAfter, TelegramServerError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter, TelegramServerError
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     BufferedInputFile,
@@ -34,6 +34,8 @@ from nova_transcriber.safe_logging import configure_logging
 
 FILE_ROOT = Path("/var/lib/telegram-bot-api")
 DOWNLOAD_LOCK = asyncio.Lock()
+HISTORY_LOCK = asyncio.Lock()
+HISTORY_PANEL = {}
 
 
 async def start(message: Message) -> None:
@@ -74,7 +76,7 @@ def _partial_keyboard(record):
     ]])
 
 
-def _recording_summary(record: dict) -> str:
+def _recording_name(record: dict) -> str:
     names = {
         "voice": "Голосовое сообщение", "video_note": "Видеосообщение",
         "audio": "Аудиозапись", "video": "Видеозапись",
@@ -88,6 +90,11 @@ def _recording_summary(record: dict) -> str:
     filename = " ".join(filename.split())
     if len(filename) > 200:
         filename = filename[:199] + "…"
+    return filename
+
+
+def _recording_summary(record: dict) -> str:
+    filename = _recording_name(record)
     created_at = record.get("created_at")
     date = "Дата неизвестна"
     if isinstance(created_at, str):
@@ -98,7 +105,7 @@ def _recording_summary(record: dict) -> str:
         date = created_at.astimezone(
             ZoneInfo(os.environ.get("DISPLAY_TIMEZONE", "Europe/Moscow"))
         ).strftime("%d.%m.%Y, %H:%M")
-    lines = [f"Задача №{record['id']}", f"Файл: {filename}", f"Дата: {date}"]
+    lines = [f"Запись №{record.get('number') or record['id']}", f"Файл: {filename}", f"Дата: {date}"]
     for key, label in (("duration", "Длительность записи"),
                        ("processing_time", "Время обработки")):
         value = record.get(key)
@@ -108,9 +115,10 @@ def _recording_summary(record: dict) -> str:
         "pending": "Ожидает обработки", "processing": "Обрабатывается",
         "completed": "Завершена",
         "failed": "Ошибка",
+        "paused": "Приостановлена",
     }
     lines.append(f"Состояние: {statuses.get(record.get('status'), 'Неизвестно')}")
-    if record.get('status') in {'processing', 'failed'} and record.get('total_samples'):
+    if record.get('status') in {'pending', 'processing', 'failed', 'paused'} and record.get('total_samples'):
         lines.append(f"Обработано: {_progress(record)}")
     if record.get("status") == "failed" and record.get("error_reason"):
         reason = record["error_reason"].rstrip(".")
@@ -144,42 +152,92 @@ def _recording_summary(record: dict) -> str:
     return "\n".join(lines)
 
 
+def _history_label(record):
+    status = {
+        'completed': '✅ Готово', 'pending': '⏳ В очереди',
+        'processing': '⏳ Распознаётся', 'paused': '⏸ Приостановлена',
+        'failed': '⚠️ Ошибка',
+    }[record['status']]
+    if record['status'] == 'processing' and record.get('total_samples'):
+        status += f" · {min(100, record['processed_samples'] * 100 // record['total_samples'])}%"
+    duration = _duration(record['duration']) if record.get('duration') is not None else 'длительность уточняется'
+    return f"№{record['number']}. {_recording_name(record)}\n{status} · {duration}"
+
+
+async def _show_history(message=None, page=0, identifier=None, *, new=False):
+    async with HISTORY_LOCK:
+        if message is None:
+            if not HISTORY_PANEL:
+                return
+            message, page, identifier = (HISTORY_PANEL[key] for key in ('message', 'page', 'identifier'))
+        rows = []
+        if identifier is None:
+            result = await asyncio.to_thread(api_client.request, f'/history?page={page}')
+            page = result['page']
+            text = f"История транскрибаций\nЗаписей: {result['total']} · Выберите нужную"
+            if not result['total']:
+                text = 'История транскрибаций пока пуста'
+            if result['items']:
+                text += '\n\n' + '\n\n'.join(_history_label(record) for record in result['items'])
+                rows.append([InlineKeyboardButton(text=str(record['number']),
+                    callback_data=f"history:open:{record['id']}:{page}") for record in result['items']])
+            navigation = []
+            if page:
+                navigation.append(InlineKeyboardButton(text='Назад', callback_data=f'history:page:{page - 1}'))
+            navigation.append(InlineKeyboardButton(text=f"{page + 1} / {result['pages']}", callback_data='history:noop:0'))
+            if page + 1 < result['pages']:
+                navigation.append(InlineKeyboardButton(text='Далее', callback_data=f'history:page:{page + 1}'))
+            rows.append(navigation)
+        else:
+            record = await asyncio.to_thread(api_client.request, f'/tasks/{identifier}')
+            text = _recording_summary(record)
+            if record['status'] == 'completed' or record.get('has_partial_result'):
+                rows.append([InlineKeyboardButton(
+                    text='📄 Скачать TXT' if record['status'] == 'completed' else '📄 Скачать неполный TXT',
+                    callback_data=f'history:txt:{identifier}')])
+            names = {'cancel': 'Отменить', 'resume': 'Продолжить', 'retry': 'Повторить'}
+            for action in record['actions']:
+                rows.append([InlineKeyboardButton(text=names[action], callback_data=f'history:{action}:{identifier}:{page}')])
+            rows.append([InlineKeyboardButton(text='К списку', callback_data=f'history:page:{page}')])
+        updated_at = datetime.now(timezone.utc).astimezone(
+            ZoneInfo(os.environ.get('DISPLAY_TIMEZONE', 'Europe/Moscow'))
+        ).strftime('%d.%m.%Y, %H:%M:%S')
+        text += f'\n\n──────────\nОбновлено: {updated_at}'
+        keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
+        signature = (message.chat.id, message.message_id, text, keyboard.model_dump_json())
+        if new:
+            message = await message.answer(text, parse_mode=None, reply_markup=keyboard)
+            signature = (message.chat.id, message.message_id, text, keyboard.model_dump_json())
+        elif HISTORY_PANEL.get('signature') != signature:
+            try:
+                await message.edit_text(text, parse_mode=None, reply_markup=keyboard)
+            except TelegramAPIError as error:
+                if 'message is not modified' not in error.message.lower():
+                    if isinstance(error, TelegramBadRequest):
+                        HISTORY_PANEL.clear()
+                    raise
+        HISTORY_PANEL.update(message=message, page=page, identifier=identifier, signature=signature)
+
+
 async def history(message: Message) -> None:
     try:
-        records = await asyncio.to_thread(api_client.request, '/tasks?limit=10')
+        await _show_history(message, new=True)
     except Exception:
-        logging.getLogger(__name__).exception("Не удалось получить историю")
-        await message.answer("Не удалось загрузить историю. Попробуйте позже.")
-        return
-
-    if not records:
-        await message.answer("История транскрибаций пока пуста")
-        return
-
-    for record in records:
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(
-                text="Скачать TXT" if record['status'] == 'completed' else 'Скачать неполный TXT',
-                callback_data=f"history:txt:{record['id']}"
-            ),
-            InlineKeyboardButton(
-                text="Информация", callback_data=f"history:info:{record['id']}"
-            ),
-        ]])
-        await message.answer(
-            _recording_summary(record), parse_mode=None,
-            reply_markup=keyboard if record["status"] == "completed" or record.get('has_partial_result') else None,
-        )
+        logging.getLogger(__name__).exception('Не удалось получить историю')
+        await message.answer('Не удалось загрузить историю. Попробуйте позже.')
 
 
 async def history_callback(callback: CallbackQuery) -> None:
     parts = (callback.data or "").split(":")
     if (
-        len(parts) != 3
-        or parts[1] not in {"txt", "info"}
+        len(parts) not in {3, 4}
+        or parts[1] not in {'txt', 'info', 'page', 'open', 'cancel', 'resume', 'retry', 'noop'}
         or not parts[2].isascii()
         or not parts[2].isdigit()
-        or not 0 < int(parts[2]) <= 9223372036854775807
+        or not 0 <= int(parts[2]) <= 9223372036854775807
+        or (parts[1] not in {'page', 'noop'} and int(parts[2]) == 0)
+        or (parts[1] == 'page' and int(parts[2]) > 2147483647)
+        or (len(parts) == 4 and (not parts[3].isascii() or not parts[3].isdigit() or not 0 <= int(parts[3]) <= 2147483647))
     ):
         await callback.answer("Некорректный идентификатор.", show_alert=True)
         return
@@ -188,14 +246,34 @@ async def history_callback(callback: CallbackQuery) -> None:
         return
 
     await callback.answer()
+    action = parts[1]
+    if action == 'noop':
+        return
+    identifier = int(parts[2])
+    page = int(parts[3]) if len(parts) == 4 else 0
     try:
-        record = await asyncio.to_thread(api_client.record, int(parts[2]))
+        if action == 'page':
+            await _show_history(callback.message, identifier)
+            return
+        if action in {'cancel', 'resume', 'retry'}:
+            await asyncio.to_thread(api_client.request, f'/tasks/{identifier}/{action}', {})
+        if action != 'txt':
+            await _show_history(callback.message, page, identifier)
+            return
+        record = await asyncio.to_thread(api_client.record, identifier)
+    except ValueError as error:
+        await callback.answer(str(error), show_alert=True)
+        try:
+            await _show_history(callback.message, page, identifier)
+        except Exception:
+            logging.getLogger(__name__).exception('Не удалось обновить карточку')
+        return
     except Exception:
         logging.getLogger(__name__).exception("Не удалось получить транскрибацию")
-        await callback.message.answer("Не удалось загрузить результат. Попробуйте позже.")
+        await callback.answer('Не удалось загрузить данные. Попробуйте позже.', show_alert=True)
         return
     if record.get("text") is None:
-        await callback.message.answer("Сохранённых частей пока нет.")
+        await callback.answer("Сохранённых частей пока нет.", show_alert=True)
         return
 
     if parts[1] == "txt":
@@ -211,14 +289,8 @@ async def history_callback(callback: CallbackQuery) -> None:
                 caption='Неполный результат' if partial else None,
             )
         except TelegramAPIError:
-            await callback.message.answer("Не удалось отправить TXT. Попробуйте позже.")
+            await callback.answer("Не удалось отправить TXT. Попробуйте позже.", show_alert=True)
         return
-
-    await callback.message.answer(
-        f"{_recording_summary(record)}\nРазмер: {record['file_size']} байт\n"
-        f"Модель: {record['model']}\nСимволов: {len(record['text'])}",
-        parse_mode=None,
-    )
 
 
 async def receive_file(
@@ -418,6 +490,10 @@ async def notifications(bot):
                 delivered.discard(identifier)
             except Exception:
                 logger.bind(component='Telegram Adapter', task_id=record['id'], event='notification_retry').warning('Не удалось доставить или подтвердить уведомление; попытка будет повторена')
+        try:
+            await _show_history()
+        except Exception:
+            logger.bind(component='Telegram Adapter', event='history_refresh_failed').warning('Не удалось обновить открытую историю')
         await asyncio.sleep(5)
 
 async def main() -> None:

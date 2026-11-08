@@ -2,7 +2,7 @@ import logging
 import os
 import re
 import sys
-from datetime import timezone
+from zoneinfo import ZoneInfo
 
 from loguru import logger
 
@@ -26,6 +26,7 @@ def task_log(task_id: int, event: str, message: str, *,
 
 
 def configure_logging() -> None:
+    log_timezone = ZoneInfo(os.environ.get("DISPLAY_TIMEZONE") or "Europe/Moscow")
     original_factory = logging.getLogRecordFactory()
 
     def record_factory(*args, **kwargs):
@@ -44,7 +45,10 @@ def configure_logging() -> None:
         record["message"] = sanitize(record["message"])
         record["extra"] = {key: sanitize(str(value)) for key, value in record["extra"].items()}
         record["extra"]["level_ru"] = {"INFO": "ИНФО", "ERROR": "ОШИБКА", "WARNING": "ПРЕДУПРЕЖДЕНИЕ"}.get(record["level"].name, record["level"].name)
-        record["extra"]["utc_time"] = record["time"].astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        record["extra"]["local_time"] = (
+            record["time"].astimezone(log_timezone).strftime("%Y-%m-%d %H:%M:%S")
+            + f" {log_timezone.key}"
+        )
 
     logger.remove()
     logger.configure(patcher=patch_record, extra={
@@ -52,7 +56,7 @@ def configure_logging() -> None:
         "duration": "—", "error": "—",
     })
     logger.add(sys.stderr, format=(
-        "{extra[utc_time]} | {extra[level_ru]} | {extra[component]} | "
+        "{extra[local_time]} | {extra[level_ru]} | {extra[component]} | "
         "Задача {extra[task_id]} | {extra[event]} | {message} | "
         "{extra[duration]} | {extra[error]}"
     ), diagnose=False, backtrace=False)

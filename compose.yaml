@@ -15,6 +15,7 @@ services:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_ALLOWED_USER_ID: ${TELEGRAM_ALLOWED_USER_ID:-}
       MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB-100}
+      DISPLAY_TIMEZONE: ${DISPLAY_TIMEZONE:-Europe/Moscow}
     volumes:
       - ./data:/data
       - ./models:/app/models:ro

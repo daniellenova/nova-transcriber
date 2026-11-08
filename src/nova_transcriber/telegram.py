@@ -1,6 +1,10 @@
 import asyncio
 import logging
 import os
+import math
+import re
+from datetime import timezone
+from zoneinfo import ZoneInfo
 from decimal import Decimal, DecimalException
 from pathlib import Path
 
@@ -45,28 +49,86 @@ async def start(message: Message) -> None:
     )
 
 
+def _duration(value: float) -> str:
+    hours, seconds = divmod(round(value), 3600)
+    minutes, seconds = divmod(seconds, 60)
+    parts = []
+    if hours:
+        parts.append(f"{hours} ч")
+    if minutes:
+        parts.append(f"{minutes} мин")
+    if seconds or not parts:
+        parts.append(f"{seconds} с")
+    return " ".join(parts)
+
+
 def _recording_summary(record: dict) -> str:
-    created_at = record["created_at"].strftime("%d.%m.%Y %H:%M:%S %z")
-    summary = f"Файл: {record['filename'][:1024]}\nДата: {created_at}"
-    if record["duration"] is not None:
-        summary += f"\nДлительность: {record['duration']:g} с"
-    return summary
+    names = {
+        "voice": "Голосовое сообщение", "video_note": "Видеосообщение",
+        "audio": "Аудиозапись", "video": "Видеозапись",
+    }
+    source_type = record.get("source_type")
+    filename = record.get("filename") or ""
+    if (source_type in {"voice", "video_note"} or not filename
+            or "/" in filename or "\\" in filename
+            or re.fullmatch(r"file_\d+(?:\.[^.]*)?", filename)):
+        filename = names.get(source_type, "Файл без названия")
+    filename = " ".join(filename.split())
+    if len(filename) > 200:
+        filename = filename[:199] + "…"
+    created_at = record.get("created_at")
+    date = "Дата неизвестна"
+    if created_at is not None:
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        date = created_at.astimezone(
+            ZoneInfo(os.environ.get("DISPLAY_TIMEZONE", "Europe/Moscow"))
+        ).strftime("%d.%m.%Y, %H:%M")
+    lines = [f"Задача №{record['id']}", f"Файл: {filename}", f"Дата: {date}"]
+    for key, label in (("duration", "Длительность записи"),
+                       ("processing_time", "Время обработки")):
+        value = record.get(key)
+        if value is not None and math.isfinite(value) and value >= 0:
+            lines.append(f"{label}: {_duration(value)}")
+    statuses = {
+        "pending": "Ожидает обработки", "processing": "Обрабатывается",
+        "completed": "Завершена", "done": "Завершена",
+        "failed": "Ошибка", "error": "Ошибка",
+    }
+    lines.append(f"Состояние: {statuses.get(record.get('status'), 'Неизвестно')}")
+    if record.get("status") in {"failed", "error"} and record.get("error_reason"):
+        reason = record["error_reason"].rstrip(".")
+        safe_reasons = {
+            "Файл пустой", "Неподдерживаемый формат файла",
+            "Не удалось прочитать аудио или видео", "Не удалось обработать файл",
+            "Ошибка распознавания аудио или видео",
+            "Обработка отменена до начала распознавания",
+            "Обработка прервана до начала распознавания",
+        }
+        reasons = {
+            "Не удалось сохранить результат в PostgreSQL": "Не удалось сохранить результат",
+            "Не удалось начать обработку в PostgreSQL": "Не удалось начать обработку",
+        }
+        reason = reasons.get(reason, reason if reason in safe_reasons else "Не удалось обработать файл")
+        lines.append(f"Причина: {reason}.")
+    return "\n".join(lines)
 
 
 async def history(message: Message) -> None:
+    if message.from_user is None:
+        return
     try:
-        records = await asyncio.to_thread(database.get_recent_transcriptions, 10)
+        records = await asyncio.to_thread(database.get_recent_transcriptions, 10, message.from_user.id)
     except Exception:
         logging.getLogger(__name__).exception("Не удалось получить историю")
         await message.answer("Не удалось загрузить историю. Попробуйте позже.")
         return
 
-    successful = [record for record in records if record["status"] == "done"]
-    if not successful:
-        await message.answer("Среди последних 10 транскрибаций нет готовых результатов.")
+    if not records:
+        await message.answer("История транскрибаций пока пуста")
         return
 
-    for record in successful:
+    for record in records:
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(
                 text="Скачать TXT", callback_data=f"history:txt:{record['id']}"
@@ -75,7 +137,10 @@ async def history(message: Message) -> None:
                 text="Информация", callback_data=f"history:info:{record['id']}"
             ),
         ]])
-        await message.answer(_recording_summary(record), reply_markup=keyboard)
+        await message.answer(
+            _recording_summary(record), parse_mode=None,
+            reply_markup=keyboard if record["status"] == "done" else None,
+        )
 
 
 async def history_callback(callback: CallbackQuery) -> None:
@@ -95,7 +160,7 @@ async def history_callback(callback: CallbackQuery) -> None:
 
     await callback.answer()
     try:
-        record = await asyncio.to_thread(database.get_transcription, int(parts[2]))
+        record = await asyncio.to_thread(database.get_transcription, int(parts[2]), callback.from_user.id)
     except Exception:
         logging.getLogger(__name__).exception("Не удалось получить транскрибацию")
         await callback.message.answer("Не удалось загрузить результат. Попробуйте позже.")
@@ -114,15 +179,10 @@ async def history_callback(callback: CallbackQuery) -> None:
             await callback.message.answer("Не удалось отправить TXT. Попробуйте позже.")
         return
 
-    processing_time = record["processing_time"]
-    processing = f"{processing_time:g} с" if processing_time is not None else "неизвестно"
-    summary = _recording_summary(record)
-    if record["duration"] is None:
-        summary += "\nДлительность: неизвестна"
     await callback.message.answer(
-        f"{summary}\nРазмер: {record['file_size']} байт\n"
-        f"Модель: {record['model']}\nВремя обработки: {processing}\n"
-        f"Символов: {len(record['text'])}"
+        f"{_recording_summary(record)}\nРазмер: {record['file_size']} байт\n"
+        f"Модель: {record['model']}\nСимволов: {len(record['text'])}",
+        parse_mode=None,
     )
 
 
@@ -150,7 +210,10 @@ async def receive_file(
         path = path.resolve()
         if not path.is_relative_to(FILE_ROOT) or not path.is_file():
             raise ValueError("Локальный файл недоступен в общем каталоге")
-        filename = getattr(media, "file_name", None) or path.name
+        filename = getattr(media, "file_name", None) or {
+            "voice": "Голосовое сообщение", "video_note": "Видеосообщение",
+            "audio": "Аудиозапись", "video": "Видеозапись",
+        }.get(source_type, path.name)
         file_size = path.stat().st_size
     except (TelegramAPIError, OSError, ValueError):
         await message.answer(
@@ -232,6 +295,7 @@ async def receive_file(
 async def main() -> None:
     configure_logging()
     max_file_size_mb = _read_max_file_size_mb()
+    ZoneInfo(os.environ.get("DISPLAY_TIMEZONE", "Europe/Moscow"))
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     allowed_user_id = int(os.environ["TELEGRAM_ALLOWED_USER_ID"])
     if allowed_user_id <= 0:
@@ -247,7 +311,7 @@ async def main() -> None:
     dispatcher.message.register(history, Command("history"))
     dispatcher.callback_query.register(history_callback, F.data.startswith("history:"))
     dispatcher.message.register(
-        receive_file, F.content_type.in_({"voice", "audio", "video", "document"})
+        receive_file, F.content_type.in_({"voice", "video_note", "audio", "video", "document"})
     )
 
     session = AiohttpSession(

@@ -158,7 +158,7 @@ def fail_transcription(
             raise ValueError(f"Транскрибация не найдена: {transcription_id}")
 
 
-def get_recent_transcriptions(limit: int = 10) -> list[dict[str, Any]]:
+def get_recent_transcriptions(limit: int = 10, user_id: int | None = None) -> list[dict[str, Any]]:
     if limit < 1:
         raise ValueError("Количество транскрибаций должно быть положительным")
     with _connect() as connection:
@@ -169,13 +169,14 @@ def get_recent_transcriptions(limit: int = 10) -> list[dict[str, Any]]:
                 r.filename, r.source_type, r.file_size, r.duration
             FROM transcriptions AS t
             JOIN recordings AS r ON r.id = t.recording_id
+            WHERE t.user_id = %s
             ORDER BY t.created_at DESC, t.id DESC LIMIT %s
             """,
-            (limit,),
+            (user_id, limit),
         ).fetchall()
 
 
-def get_transcription(transcription_id: int) -> dict[str, Any] | None:
+def get_transcription(transcription_id: int, user_id: int | None = None) -> dict[str, Any] | None:
     with _connect() as connection:
         return connection.execute(
             """
@@ -184,7 +185,7 @@ def get_transcription(transcription_id: int) -> dict[str, Any] | None:
                 r.filename, r.source_type, r.file_size, r.duration
             FROM transcriptions AS t
             JOIN recordings AS r ON r.id = t.recording_id
-            WHERE t.id = %s
+            WHERE t.id = %s AND t.user_id = %s
             """,
-            (transcription_id,),
+            (transcription_id, user_id),
         ).fetchone()

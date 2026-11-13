@@ -58,7 +58,7 @@ def _run_task(connection, task, path, stopping, timeout):
         return task['processing_time'] + perf_counter() - started
 
     try:
-        connection.execute("UPDATE transcriptions SET progress_samples = processed_samples WHERE id = %s AND status = 'processing'", (identifier,))
+        database.reset_progress(connection, identifier)
         process.start()
         child.close()
         while not stopping.is_set():
@@ -67,8 +67,8 @@ def _run_task(connection, task, path, stopping, timeout):
                 database.update_progress(connection, identifier, progress_samples)
                 progress_saved_at = now
             if now - heartbeat >= 1:
-                state = connection.execute('SELECT status FROM transcriptions WHERE id = %s', (identifier,)).fetchone()
-                if state['status'] != 'processing':
+                state = database.task_status(connection, identifier)
+                if state != 'processing':
                     return None, False, elapsed()
                 heartbeat = now
             if now - stage_started > timeout:
@@ -85,7 +85,7 @@ def _run_task(connection, task, path, stopping, timeout):
                 stage = message[1]
                 logger.bind(component='Whisper Worker', task_id=identifier, event='stage').info('Этап: {}', stage)
                 stage_started = perf_counter()
-                connection.execute("UPDATE transcriptions SET stage = %s WHERE id = %s AND status = 'processing'", (stage, identifier))
+                database.set_stage(connection, identifier, stage)
             elif message[0] == 'duration':
                 if not database.set_audio_duration(connection, identifier, message[1]):
                     return None, False, elapsed()
@@ -144,8 +144,7 @@ def main():
     while not stopping.is_set():
         try:
             database.cleanup_deleted_tasks()
-            with database._connect() as connection:
-                connection.autocommit = True
+            with database.worker_session() as connection:
                 task = database.claim_task(connection)
                 if task is None:
                     stopping.wait(3)
@@ -168,28 +167,26 @@ def main():
                     continue
                 while not stopping.is_set():
                     reason, retryable, elapsed = _run_task(connection, task, path, stopping, timeout)
-                    state = connection.execute('SELECT status FROM transcriptions WHERE id = %s', (identifier,)).fetchone()['status']
+                    state = database.task_status(connection, identifier)
                     if state == 'paused':
-                        connection.execute("UPDATE transcriptions SET processing_time = %s WHERE id = %s AND status = 'paused'", (elapsed, identifier))
+                        database.save_paused_time(connection, identifier, elapsed)
                         task_log.bind(event='paused').info('Обработка остановлена пользователем; сохранённые части оставлены')
                         break
                     if stopping.is_set():
-                        connection.execute("""UPDATE transcriptions SET processing_time = %s,
-                            status = 'pending', stage = NULL WHERE id = %s AND status = 'processing'""",
-                            (elapsed, identifier))
+                        database.requeue_task(connection, identifier, elapsed)
                         break
                     if reason is None:
                         task_log.bind(event='completed').info('Результат сохранён. Транскрибация завершена')
                         break
-                    row = connection.execute('SELECT retry_count FROM transcriptions WHERE id = %s', (identifier,)).fetchone()
-                    if not retryable or row['retry_count'] >= 3:
+                    retry_count = database.task_retry_count(connection, identifier)
+                    if not retryable or retry_count >= 3:
                         database.fail_task(connection, identifier, reason, elapsed)
                         task_log.bind(event='failed', error=reason).error('Обработка завершилась ошибкой')
                         break
-                    connection.execute('UPDATE transcriptions SET retry_count = retry_count + 1, processing_time = %s WHERE id = %s', (elapsed, identifier))
+                    database.record_retry(connection, identifier, elapsed)
                     task['processing_time'] = elapsed
                     task_log.bind(event='retry', error=reason).warning('Повтор с последнего сохранённого фрагмента')
-                    stopping.wait(2 ** (row['retry_count'] + 1))
+                    stopping.wait(2 ** (retry_count + 1))
         except Exception:
             log.bind(event='worker_error', error='Ошибка подключения или сохранения состояния').error('Не удалось обработать очередь; повтор через 3 секунды')
             stopping.wait(3)

@@ -32,11 +32,11 @@ def check_disk_space(path, required_bytes: int = 0) -> None:
         raise MediaError("Недостаточно свободного места на диске")
 
 
-def get_owner_id() -> int:
+def get_owner_id(name="TELEGRAM_ALLOWED_USER_ID", default=None) -> int:
     try:
-        value = int(os.environ["TELEGRAM_ALLOWED_USER_ID"])
+        value = int(os.environ.get(name, default))
         if not 0 < value <= 9223372036854775807:
             raise ValueError
-    except (KeyError, ValueError):
-        raise ValueError("TELEGRAM_ALLOWED_USER_ID должен быть положительным целым числом в диапазоне BIGINT") from None
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} должен быть положительным целым числом в диапазоне BIGINT") from None
     return value

@@ -30,15 +30,12 @@ def api_record(record):
             "has_partial_result": record["status"] != "completed" and record["processed_samples"] > 0}
 
 
-def create_api_task(data, user_id):
-    if not isinstance(data, dict):
-        raise ValueError("Ожидается объект")
-    filename = data.get("filename")
-    source_type = data.get("source_type")
-    key = data.get("file_key")
+def create_api_task(*, user_id, file_path, source, filename, duration=None,
+                    request_key=None, notification=None):
+    key = file_path
     if not isinstance(filename, str) or not filename.strip() or len(filename) > 255 or any(c in filename for c in ("/", "\\", "\x00")):
         raise ValueError("Недопустимое имя файла")
-    if source_type not in {"voice", "audio", "video", "video_note", "document"}:
+    if source not in {"voice", "audio", "video", "video_note", "document"}:
         raise ValueError("Недопустимый тип файла")
     if not isinstance(key, str) or not key or "\\" in key or Path(key).is_absolute() or ".." in Path(key).parts:
         raise ValueError("Недопустимая ссылка на файл")
@@ -51,21 +48,18 @@ def create_api_task(data, user_id):
         raise ValueError("Недопустимый размер файла")
     if not size:
         raise EmptyFileError()
-    if source_type == "document" and Path(filename).suffix.lower() not in SUPPORTED_MEDIA_EXTENSIONS:
+    if source == "document" and Path(filename).suffix.lower() not in SUPPORTED_MEDIA_EXTENSIONS:
         raise UnsupportedFormatError()
-    duration = data.get("duration")
     if duration is not None and (type(duration) not in {int, float} or not math.isfinite(duration) or duration < 0):
         raise ValueError("Недопустимая длительность")
     if duration is not None and duration > get_positive_int("MAX_DURATION_SECONDS", 43200):
         raise ValueError("Запись превышает допустимую длительность")
-    for field in ('telegram_chat_id', 'telegram_message_id'):
-        if data.get(field) is not None and (type(data[field]) is not int or not -9223372036854775808 <= data[field] <= 9223372036854775807):
-            raise ValueError('Недопустимые метаданные уведомления')
-    if (data.get('telegram_chat_id') is None) != (data.get('telegram_message_id') is None):
-        raise ValueError('Нужны оба идентификатора Telegram-сообщения')
-    if data.get('request_key') is not None and (not isinstance(data['request_key'], str) or not 1 <= len(data['request_key']) <= 200):
+    if request_key is not None and (not isinstance(request_key, str) or not 1 <= len(request_key) <= 200):
         raise ValueError('Недопустимый ключ запроса')
-    task = database.create_task(filename, source_type, size, duration, user_id, path.relative_to(root).as_posix(), data)
+    task = database.create_task(
+        filename, source, size, duration, user_id, path.relative_to(root).as_posix(),
+        {'request_key': request_key, 'notification': notification},
+    )
     logger.bind(component="Core", task_id=task['id'], event="created").info("Задача зарегистрирована через внутренний API")
     return task
 

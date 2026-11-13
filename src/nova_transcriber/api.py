@@ -40,7 +40,7 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(401, {"detail": "Доступ запрещён"})
             return
         try:
-            user_id = get_owner_id()
+            user_id = get_owner_id("CORE_OWNER_ID", 1)
             url = urlsplit(self.path)
             parts = url.path.strip("/").split("/")
             if self.command == 'POST' and len(parts) == 3 and parts[0] == 'tasks' and parts[2] == 'delivery':
@@ -99,7 +99,21 @@ class Handler(BaseHTTPRequestHandler):
                 if not 0 < length <= 16384:
                     raise ValueError("Недопустимый размер запроса")
                 data = json.loads(self.rfile.read(length))
-                self.respond(201, core.create_api_task(data, user_id))
+                if not isinstance(data, dict):
+                    raise ValueError('Ожидается объект')
+                for field in ('telegram_chat_id', 'telegram_message_id'):
+                    if data.get(field) is not None and (type(data[field]) is not int or not -9223372036854775808 <= data[field] <= 9223372036854775807):
+                        raise ValueError('Недопустимые метаданные уведомления')
+                if (data.get('telegram_chat_id') is None) != (data.get('telegram_message_id') is None):
+                    raise ValueError('Нужны оба идентификатора Telegram-сообщения')
+                notification = None
+                if data.get('telegram_chat_id') is not None:
+                    notification = {'chat_id': data['telegram_chat_id'], 'message_id': data['telegram_message_id']}
+                self.respond(201, core.create_api_task(
+                    user_id=user_id, file_path=data.get('file_key'), source=data.get('source_type'),
+                    filename=data.get('filename'), duration=data.get('duration'),
+                    request_key=data.get('request_key'), notification=notification,
+                ))
                 return
             if self.command == "GET" and parts == ["tasks"]:
                 limit = int(parse_qs(url.query).get("limit", ["10"])[0])
@@ -138,7 +152,7 @@ def main():
     configure_logging()
     if len(os.environ.get("CORE_API_TOKEN", "")) < 32:
         raise ValueError("CORE_API_TOKEN должен содержать не менее 32 символов")
-    get_owner_id()
+    get_owner_id("CORE_OWNER_ID", 1)
     get_max_file_size_mb()
     get_positive_int('MAX_DURATION_SECONDS', 43200)
     if not Path(os.environ["CORE_MEDIA_ROOT"]).is_dir():

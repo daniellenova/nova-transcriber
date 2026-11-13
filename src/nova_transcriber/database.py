@@ -1,4 +1,5 @@
 import os
+from contextlib import contextmanager
 from typing import Any
 
 import psycopg
@@ -351,7 +352,7 @@ def create_task(filename, source_type, file_size, duration, user_id, file_key, m
         return connection.execute(
             """INSERT INTO transcriptions (recording_id, model, status, user_id, file_key, request_key, telegram_chat_id, telegram_message_id, number, created_at)
             VALUES (%s, 'large-v3', 'pending', %s, %s, %s, %s, %s, %s, clock_timestamp()) RETURNING id, status""",
-            (recording["id"], user_id, file_key, key, metadata.get('telegram_chat_id'), metadata.get('telegram_message_id'), number),
+            (recording["id"], user_id, file_key, key, (metadata.get('notification') or {}).get('chat_id'), (metadata.get('notification') or {}).get('message_id'), number),
         ).fetchone()
 
 
@@ -454,3 +455,39 @@ def get_transcription(transcription_id: int, user_id: int | None = None, *, incl
             (transcription_id, user_id),
         ).fetchone()
 
+
+
+@contextmanager
+def worker_session():
+    with _connect() as connection:
+        connection.autocommit = True
+        yield connection
+
+
+def reset_progress(connection, identifier):
+    connection.execute("UPDATE transcriptions SET progress_samples = processed_samples WHERE id = %s AND status = 'processing'", (identifier,))
+
+
+def task_status(connection, identifier):
+    return connection.execute('SELECT status FROM transcriptions WHERE id = %s', (identifier,)).fetchone()['status']
+
+
+def set_stage(connection, identifier, stage):
+    connection.execute("UPDATE transcriptions SET stage = %s WHERE id = %s AND status = 'processing'", (stage, identifier))
+
+
+def save_paused_time(connection, identifier, elapsed):
+    connection.execute("UPDATE transcriptions SET processing_time = %s WHERE id = %s AND status = 'paused'", (elapsed, identifier))
+
+
+def requeue_task(connection, identifier, elapsed):
+    connection.execute("""UPDATE transcriptions SET processing_time = %s,
+        status = 'pending', stage = NULL WHERE id = %s AND status = 'processing'""", (elapsed, identifier))
+
+
+def task_retry_count(connection, identifier):
+    return connection.execute('SELECT retry_count FROM transcriptions WHERE id = %s', (identifier,)).fetchone()['retry_count']
+
+
+def record_retry(connection, identifier, elapsed):
+    connection.execute('UPDATE transcriptions SET retry_count = retry_count + 1, processing_time = %s WHERE id = %s', (elapsed, identifier))

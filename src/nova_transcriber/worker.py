@@ -8,6 +8,7 @@ from time import perf_counter
 from loguru import logger
 
 from nova_transcriber import database
+from nova_transcriber.stages import LABELS, PREPARING, MEASURING
 from nova_transcriber.config import check_disk_space, get_max_file_size_mb, get_positive_int
 from nova_transcriber.errors import MediaError
 from nova_transcriber.safe_logging import configure_logging
@@ -19,7 +20,7 @@ def _transcribe(pipe, path, processed_samples, total_samples):
         from nova_transcriber import asr
 
         if total_samples is None:
-            pipe.send(('stage', 'Определение длительности'))
+            pipe.send(('stage', MEASURING))
             total_samples = asr.audio_samples(path)
             pipe.send(('duration', total_samples))
             pipe.recv()
@@ -52,7 +53,7 @@ def _run_task(connection, task, path, stopping, timeout):
     stage_started = heartbeat = started
     progress_saved_at = started
     progress_samples = task['processed_samples']
-    stage = 'Подготовка аудио'
+    stage = PREPARING
     identifier = task['id']
     def elapsed():
         return task['processing_time'] + perf_counter() - started
@@ -72,7 +73,7 @@ def _run_task(connection, task, path, stopping, timeout):
                     return None, False, elapsed()
                 heartbeat = now
             if now - stage_started > timeout:
-                return f'Превышено время этапа «{stage}»', True, elapsed()
+                return f'Превышено время этапа «{LABELS.get(stage, stage)}»', True, elapsed()
             if not parent.poll(0.5):
                 if not process.is_alive():
                     return 'Процесс обработки неожиданно остановился', True, elapsed()
@@ -83,7 +84,7 @@ def _run_task(connection, task, path, stopping, timeout):
                 return 'Процесс обработки неожиданно остановился', True, elapsed()
             if message[0] == 'stage':
                 stage = message[1]
-                logger.bind(component='Whisper Worker', task_id=identifier, event='stage').info('Этап: {}', stage)
+                logger.bind(component='Whisper Worker', task_id=identifier, event='stage').info('Этап: {}', LABELS.get(stage, stage))
                 stage_started = perf_counter()
                 database.set_stage(connection, identifier, stage)
             elif message[0] == 'duration':
@@ -144,6 +145,9 @@ def main():
     while not stopping.is_set():
         try:
             database.cleanup_deleted_tasks()
+        except Exception as error:
+            log.bind(event='cleanup_failed', error=str(error)).opt(exception=error).warning('Не удалось очистить удалённые записи; обработка очереди продолжается')
+        try:
             with database.worker_session() as connection:
                 task = database.claim_task(connection)
                 if task is None:

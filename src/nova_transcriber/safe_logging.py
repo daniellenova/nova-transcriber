@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import sys
+import traceback
 from zoneinfo import ZoneInfo
 
 from loguru import logger
@@ -46,8 +47,11 @@ def configure_logging() -> None:
 
     class LoguruHandler(logging.Handler):
         def emit(self, record):
+            message = record.getMessage()
+            if record.exc_info:
+                message += "\n" + "".join(traceback.format_exception(*record.exc_info))
             logger.bind(component=record.name, event="library_message").log(
-                record.levelname, record.getMessage()
+                record.levelname, message
             )
 
     logging.basicConfig(handlers=[LoguruHandler(level=logging.WARNING)], level=logging.WARNING, force=True)

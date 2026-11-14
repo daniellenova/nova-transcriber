@@ -1,6 +1,7 @@
 import argparse
 from pathlib import Path
 
+from nova_transcriber.stages import LABELS
 from nova_transcriber.asr import transcribe
 from nova_transcriber.safe_logging import sanitize
 
@@ -14,7 +15,7 @@ def main() -> None:
         parser.error("Входной файл не должен иметь расширение .txt")
 
     try:
-        text = transcribe(args.path, on_status=lambda message: print(message, flush=True))
+        text = transcribe(args.path, on_status=lambda message: print(LABELS.get(message, message), flush=True))
         output.write_text(text, encoding="utf-8")
     except Exception as error:
         parser.exit(1, sanitize(f"Ошибка транскрибации: {error}\n"))

@@ -1,243 +1,28 @@
-import os
-from contextlib import contextmanager
 from typing import Any
 
-import psycopg
-from loguru import logger
-from psycopg.rows import dict_row
+from nova_transcriber.db_schema import _connect, _renumber, init_db
+from nova_transcriber.db_worker import (
+    claim_task,
+    set_audio_duration,
+    update_progress,
+    save_chunk,
+    finish_chunks,
+    fail_task,
+    worker_session,
+    reset_progress,
+    task_status,
+    set_stage,
+    save_paused_time,
+    requeue_task,
+    task_retry_count,
+    record_retry,
+)
 
 
 _TASK_COLUMNS = """t.id, t.model, t.status, t.processing_time, t.created_at,
     t.started_at, t.finished_at, t.error_reason, t.telegram_chat_id, t.telegram_message_id,
     t.processed_samples, t.progress_samples, t.total_samples, t.stage, t.file_key, t.delete_requested, t.number, t.delivery_state,
     r.filename, r.source_type, r.file_size, r.duration"""
-
-
-def _connect() -> psycopg.Connection:
-    return psycopg.connect(
-        host=os.environ["PGHOST"],
-        port=os.environ["PGPORT"],
-        dbname=os.environ["PGDATABASE"],
-        user=os.environ["PGUSER"],
-        password=os.environ["PGPASSWORD"],
-        row_factory=dict_row,
-        options="-c timezone=UTC -c statement_timeout=15000 -c lock_timeout=10000",
-        connect_timeout=5,
-        keepalives_idle=10,
-        keepalives_interval=5,
-        keepalives_count=3,
-        tcp_user_timeout=30000,
-    )
-
-
-def init_db() -> None:
-    with _connect() as connection:
-        # Core и Worker могут одновременно запускаться с пустой базой.
-        connection.execute("SELECT pg_advisory_xact_lock(19790520, 1)")
-        connection.execute("""
-            CREATE TABLE IF NOT EXISTS recordings (
-                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-                filename TEXT NOT NULL,
-                source_type TEXT NOT NULL,
-                file_size BIGINT NOT NULL CHECK (file_size >= 0),
-                duration DOUBLE PRECISION CHECK (duration >= 0),
-                created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        connection.execute("""
-            CREATE TABLE IF NOT EXISTS transcriptions (
-                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-                recording_id BIGINT NOT NULL REFERENCES recordings(id),
-                model TEXT NOT NULL,
-                status TEXT NOT NULL CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
-                processing_time DOUBLE PRECISION CHECK (processing_time >= 0),
-                text TEXT,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        connection.execute("LOCK TABLE transcriptions IN ACCESS EXCLUSIVE MODE")
-        connection.execute("""
-            ALTER TABLE transcriptions
-                ADD COLUMN IF NOT EXISTS file_key TEXT,
-                ADD COLUMN IF NOT EXISTS request_key TEXT,
-                ADD COLUMN IF NOT EXISTS delivery_notified BOOLEAN NOT NULL DEFAULT FALSE,
-                ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ,
-                ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ,
-                ADD COLUMN IF NOT EXISTS error_reason TEXT,
-                ADD COLUMN IF NOT EXISTS user_id BIGINT,
-                ADD COLUMN IF NOT EXISTS telegram_chat_id BIGINT,
-                ADD COLUMN IF NOT EXISTS telegram_message_id BIGINT,
-                ADD COLUMN IF NOT EXISTS processed_samples BIGINT NOT NULL DEFAULT 0,
-                ADD COLUMN IF NOT EXISTS progress_samples BIGINT NOT NULL DEFAULT 0,
-                ADD COLUMN IF NOT EXISTS total_samples BIGINT,
-                ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0,
-                ADD COLUMN IF NOT EXISTS stage TEXT,
-                ADD COLUMN IF NOT EXISTS delete_requested BOOLEAN NOT NULL DEFAULT FALSE,
-                ADD COLUMN IF NOT EXISTS number BIGINT,
-                ADD COLUMN IF NOT EXISTS delivery_state TEXT
-        """)
-        connection.execute("""UPDATE transcriptions SET delivery_state = CASE
-            WHEN status = 'completed' AND delivery_notified THEN 'sent' ELSE 'pending' END
-            WHERE delivery_state IS NULL""")
-        connection.execute("""ALTER TABLE transcriptions
-            ALTER COLUMN delivery_state SET DEFAULT 'pending',
-            ALTER COLUMN delivery_state SET NOT NULL""")
-        connection.execute('DROP INDEX IF EXISTS transcriptions_user_number')
-        connection.execute('DROP TABLE IF EXISTS transcription_counters')
-        _renumber(connection)
-        connection.execute("""
-            CREATE TABLE IF NOT EXISTS transcription_chunks (
-                transcription_id BIGINT NOT NULL REFERENCES transcriptions(id),
-                start_sample BIGINT NOT NULL CHECK (start_sample >= 0),
-                end_sample BIGINT NOT NULL CHECK (end_sample > start_sample),
-                text TEXT NOT NULL,
-                PRIMARY KEY (transcription_id, start_sample)
-            )
-        """)
-        connection.execute("""
-            ALTER TABLE transcriptions
-                DROP CONSTRAINT IF EXISTS transcriptions_status_check
-        """)
-        connection.execute("""
-            UPDATE transcriptions SET status = CASE status
-                WHEN 'done' THEN 'completed' WHEN 'error' THEN 'failed' ELSE status END
-            WHERE status IN ('done', 'error')
-        """)
-        connection.execute("""
-            ALTER TABLE transcriptions ADD CONSTRAINT transcriptions_status_check
-                CHECK (status IN ('pending', 'processing', 'completed', 'failed', 'paused'))
-        """)
-        connection.execute("""
-            CREATE OR REPLACE FUNCTION guard_transcription_status() RETURNS trigger
-            LANGUAGE plpgsql AS $$
-            BEGIN
-                IF NEW.id IS DISTINCT FROM OLD.id THEN
-                    RAISE EXCEPTION 'Идентификатор задачи нельзя изменить';
-                END IF;
-                IF NEW.status IS DISTINCT FROM OLD.status AND NOT (
-                    (OLD.status = 'pending' AND NEW.status IN ('processing', 'failed', 'paused')) OR
-                    (OLD.status = 'processing' AND NEW.status IN ('pending', 'completed', 'failed', 'paused')) OR
-                    (OLD.status IN ('paused', 'failed') AND NEW.status = 'pending')
-                ) THEN
-                    RAISE EXCEPTION 'Недопустимый переход состояния задачи';
-                END IF;
-                IF NEW.status = 'completed' AND NEW.text IS NULL AND (
-                    OLD.status IS DISTINCT FROM NEW.status OR OLD.text IS NOT NULL
-                ) THEN
-                    RAISE EXCEPTION 'Результат задачи не сохранён';
-                END IF;
-                RETURN NEW;
-            END; $$
-        """)
-        connection.execute("""
-            CREATE OR REPLACE TRIGGER transcription_status_guard
-            BEFORE UPDATE ON transcriptions FOR EACH ROW
-            EXECUTE FUNCTION guard_transcription_status()
-        """)
-
-
-INTERRUPTED_REASON = "Обработка прервана из-за остановки или перезапуска сервиса"
-
-
-def _renumber(connection):
-    connection.execute("""WITH numbered AS (
-        SELECT id, row_number() OVER (PARTITION BY user_id ORDER BY created_at, id) AS number
-        FROM transcriptions
-    ) UPDATE transcriptions t SET number = n.number FROM numbered n
-        WHERE t.id = n.id AND t.number IS DISTINCT FROM n.number""")
-
-
-def claim_task(connection):
-    # Сеансовая блокировка остаётся после фиксации processing и освобождается
-    # PostgreSQL при разрыве соединения. Все записи Worker идут через эту сессию.
-    with connection.transaction():
-        after_id = 0
-        while True:
-            row = connection.execute("""
-                SELECT id, status, file_key, processed_samples, total_samples,
-                    retry_count, COALESCE(processing_time, 0) AS processing_time
-                FROM transcriptions
-                WHERE file_key IS NOT NULL AND NOT delete_requested
-                    AND status IN ('pending', 'processing') AND id > %s
-                ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED
-            """, (after_id,)).fetchone()
-            if row is None:
-                return None
-            after_id = row['id']
-            locked = connection.execute(
-                "SELECT pg_try_advisory_lock(%s) AS acquired", (-row['id'],)
-            ).fetchone()['acquired']
-            if not locked:
-                continue
-            if row['status'] == 'processing':
-                if row['retry_count'] >= 3:
-                    connection.execute("""
-                        UPDATE transcriptions SET status = 'failed', error_reason = %s,
-                            finished_at = clock_timestamp() WHERE id = %s
-                    """, ("Превышено число попыток восстановления", row['id']))
-                    connection.execute("SELECT pg_advisory_unlock(%s)", (-row['id'],))
-                    continue
-                connection.execute("""
-                    UPDATE transcriptions SET retry_count = retry_count + 1 WHERE id = %s
-                """, (row['id'],))
-                logger.bind(component="Очередь", task_id=row['id'], event="interrupted",
-                            error=INTERRUPTED_REASON).warning("Продолжение с сохранённого фрагмента")
-            connection.execute("""
-                UPDATE transcriptions SET status = 'processing',
-                    started_at = COALESCE(started_at, clock_timestamp()), stage = 'Подготовка аудио',
-                    progress_samples = processed_samples
-                WHERE id = %s
-            """, (row['id'],))
-            return row
-
-
-def set_audio_duration(connection, identifier, total_samples):
-    with connection.transaction():
-        if connection.execute('SELECT status FROM transcriptions WHERE id = %s FOR UPDATE', (identifier,)).fetchone()['status'] != 'processing':
-            return False
-        connection.execute("""UPDATE transcriptions SET total_samples = %s,
-            retry_count = 0 WHERE id = %s""", (total_samples, identifier))
-        connection.execute("""UPDATE recordings SET duration = %s WHERE id =
-            (SELECT recording_id FROM transcriptions WHERE id = %s)""",
-            (total_samples / 16000, identifier))
-        return True
-
-
-def update_progress(connection, identifier, samples):
-    connection.execute("""UPDATE transcriptions SET progress_samples =
-        LEAST(total_samples, GREATEST(processed_samples, progress_samples, %s))
-        WHERE id = %s AND status = 'processing'""", (samples, identifier))
-
-
-def save_chunk(connection, identifier, start_sample, end_sample, text, processing_time):
-    with connection.transaction():
-        if connection.execute('SELECT status FROM transcriptions WHERE id = %s FOR UPDATE', (identifier,)).fetchone()['status'] != 'processing':
-            return False
-        connection.execute("""INSERT INTO transcription_chunks
-            (transcription_id, start_sample, end_sample, text) VALUES (%s, %s, %s, %s)""",
-            (identifier, start_sample, end_sample, text))
-        connection.execute("""UPDATE transcriptions SET processed_samples = %s, progress_samples = %s,
-            processing_time = %s, retry_count = 0 WHERE id = %s AND status = 'processing'""",
-            (end_sample, end_sample, processing_time, identifier))
-        return True
-
-
-def finish_chunks(connection, identifier, processing_time):
-    with connection.transaction():
-        if connection.execute('SELECT status FROM transcriptions WHERE id = %s FOR UPDATE', (identifier,)).fetchone()['status'] != 'processing':
-            return False
-        cursor = connection.execute("""UPDATE transcriptions SET
-            text = (SELECT COALESCE(string_agg(text, ' ' ORDER BY start_sample)
-                FILTER (WHERE text <> ''), '') FROM transcription_chunks
-                WHERE transcription_id = %s),
-            status = 'completed', stage = NULL, error_reason = NULL,
-            processing_time = %s, finished_at = clock_timestamp()
-            WHERE id = %s AND status = 'processing' AND total_samples = processed_samples""",
-            (identifier, processing_time, identifier))
-        if cursor.rowcount != 1:
-            raise ValueError("Не все фрагменты сохранены")
-        connection.execute("DELETE FROM transcription_chunks WHERE transcription_id = %s", (identifier,))
-        return True
 
 
 def change_task(identifier, user_id, action):
@@ -326,13 +111,7 @@ def cleanup_deleted_tasks():
             AND NOT EXISTS (SELECT 1 FROM transcriptions t WHERE t.recording_id = r.id)''', (recording_ids,))
 
 
-def fail_task(connection, identifier, reason, processing_time):
-    connection.execute("""UPDATE transcriptions SET status = 'failed', stage = NULL,
-        error_reason = %s, processing_time = %s, finished_at = clock_timestamp()
-        WHERE id = %s AND status = 'processing'""", (reason, processing_time, identifier))
-
-
-def create_task(filename, source_type, file_size, duration, user_id, file_key, metadata=None):
+def create_task(filename, source_type, file_size, duration, user_id, file_key, metadata=None, *, model):
     with _connect() as connection:
         connection.execute('SELECT pg_advisory_xact_lock(19790520, 2)')
         metadata = metadata or {}
@@ -351,8 +130,8 @@ def create_task(filename, source_type, file_size, duration, user_id, file_key, m
                                     (user_id,)).fetchone()['number']
         return connection.execute(
             """INSERT INTO transcriptions (recording_id, model, status, user_id, file_key, request_key, telegram_chat_id, telegram_message_id, number, created_at)
-            VALUES (%s, 'large-v3', 'pending', %s, %s, %s, %s, %s, %s, clock_timestamp()) RETURNING id, status""",
-            (recording["id"], user_id, file_key, key, (metadata.get('notification') or {}).get('chat_id'), (metadata.get('notification') or {}).get('message_id'), number),
+            VALUES (%s, %s, 'pending', %s, %s, %s, %s, %s, %s, clock_timestamp()) RETURNING id, status""",
+            (recording["id"], model, user_id, file_key, key, (metadata.get('notification') or {}).get('chat_id'), (metadata.get('notification') or {}).get('message_id'), number),
         ).fetchone()
 
 
@@ -454,40 +233,3 @@ def get_transcription(transcription_id: int, user_id: int | None = None, *, incl
             """,
             (transcription_id, user_id),
         ).fetchone()
-
-
-
-@contextmanager
-def worker_session():
-    with _connect() as connection:
-        connection.autocommit = True
-        yield connection
-
-
-def reset_progress(connection, identifier):
-    connection.execute("UPDATE transcriptions SET progress_samples = processed_samples WHERE id = %s AND status = 'processing'", (identifier,))
-
-
-def task_status(connection, identifier):
-    return connection.execute('SELECT status FROM transcriptions WHERE id = %s', (identifier,)).fetchone()['status']
-
-
-def set_stage(connection, identifier, stage):
-    connection.execute("UPDATE transcriptions SET stage = %s WHERE id = %s AND status = 'processing'", (stage, identifier))
-
-
-def save_paused_time(connection, identifier, elapsed):
-    connection.execute("UPDATE transcriptions SET processing_time = %s WHERE id = %s AND status = 'paused'", (elapsed, identifier))
-
-
-def requeue_task(connection, identifier, elapsed):
-    connection.execute("""UPDATE transcriptions SET processing_time = %s,
-        status = 'pending', stage = NULL WHERE id = %s AND status = 'processing'""", (elapsed, identifier))
-
-
-def task_retry_count(connection, identifier):
-    return connection.execute('SELECT retry_count FROM transcriptions WHERE id = %s', (identifier,)).fetchone()['retry_count']
-
-
-def record_retry(connection, identifier, elapsed):
-    connection.execute('UPDATE transcriptions SET retry_count = retry_count + 1, processing_time = %s WHERE id = %s', (elapsed, identifier))

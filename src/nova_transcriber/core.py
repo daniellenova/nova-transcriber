@@ -5,7 +5,7 @@ from pathlib import Path
 from loguru import logger
 
 from nova_transcriber import database
-from nova_transcriber.config import get_max_file_size_mb, get_positive_int
+from nova_transcriber.config import get_asr_model, get_max_file_size_mb, get_positive_int
 from nova_transcriber.errors import EmptyFileError, UnsupportedFormatError
 
 
@@ -58,7 +58,7 @@ def create_api_task(*, user_id, file_path, source, filename, duration=None,
         raise ValueError('Недопустимый ключ запроса')
     task = database.create_task(
         filename, source, size, duration, user_id, path.relative_to(root).as_posix(),
-        {'request_key': request_key, 'notification': notification},
+        {'request_key': request_key, 'notification': notification}, model=get_asr_model(),
     )
     logger.bind(component="Core", task_id=task['id'], event="created").info("Задача зарегистрирована через внутренний API")
     return task

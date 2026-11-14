@@ -3,6 +3,8 @@ import re
 from dataclasses import dataclass, field
 from html import escape
 
+from nova_transcriber.stages import TRANSCRIBING
+
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 
@@ -75,7 +77,7 @@ def _status(record):
     if record.get('deleting'):
         return '🗑️ Удаляется'
     if record['status'] == 'processing':
-        return '🎙️ Распознаю речь' if record.get('stage') == 'Распознавание' else '⚙️ Подготавливаю'
+        return '🎙️ Распознаю речь' if record.get('stage') == TRANSCRIBING else '⚙️ Подготавливаю'
     return {'pending': '⏳ В очереди', 'completed': '✅ Готово',
             'failed': '⚠️ Не удалось обработать', 'paused': '🚫 Обработка отменена'}[record['status']]
 
@@ -84,16 +86,16 @@ def _recording_summary(record, app_state, *, progress_bar=False):
     title = _status(record)
     if record['status'] == 'completed' and record['delivery_state'] in {'failed', 'sending'} and record['id'] not in app_state.send_busy:
         title = '⚠️ Не удалось отправить TXT'
-    lines = [f"<b>{title} · №{record['number']}</b>", '', _recording_name(record), '']
+    lines = [f"<b>№{record['number']} · {title}</b>", '', f"<u>{_recording_name(record)}</u>", '']
     if record['status'] in {'pending', 'processing', 'paused', 'failed'} and record.get('total_samples'):
         lines.append(_progress(record, bar=progress_bar, compact=True))
     elif record.get('duration') is not None:
         lines.append(f"⏱ Длительность: {_duration(record['duration'])}")
-    if record['status'] == 'processing' and record.get('stage') != 'Распознавание':
+    if record['status'] == 'processing' and record.get('stage') != TRANSCRIBING:
         lines.append('\nПроверяю аудио перед распознаванием…')
     if record['status'] == 'completed':
         if record['delivery_state'] == 'sent':
-            lines.append('\n📄 TXT отправлен и доступен в истории.')
+            lines.append('\n📄 TXT отправлен и доступен в истории')
         elif record['id'] in app_state.send_busy or record['delivery_state'] == 'pending':
             lines.append('\nTXT готов. Отправляю…')
         else:
@@ -127,6 +129,6 @@ def _history_label(record):
     if record['status'] == 'processing' and record.get('total_samples'):
         status = '🎙️ ' + _progress(record).split(' · ', 1)[0]
     duration = _duration(record['duration']) if record.get('duration') is not None else 'длительность уточняется'
-    return f"<b>№{record['number']}</b> · {status} · {duration}\n{_recording_name(record)}"
+    return f"<b>№{record['number']}</b> · <u>{_recording_name(record)}</u>\n{status} · {duration}"
 
 

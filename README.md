@@ -62,6 +62,20 @@ TXT появится рядом с исходным файлом. Для лок�
 
 Зависимости разделены по extras: `postgres` для Core API, `telegram` для Adapter, `worker` для ASR и CLI. Образ Worker устанавливает `worker` и `postgres`; образы Core и Adapter не устанавливают ML-библиотеки. На Windows общая зависимость `tzdata` обеспечивает работу часовых поясов.
 
+## Получение модели
+
+Перед первым запуском скачайте [Whisper Large-v3 в формате CTranslate2](https://huggingface.co/Systran/faster-whisper-large-v3) из корня проекта (нужны uv и доступ в интернет):
+
+```sh
+uv run --extra worker python -c "from huggingface_hub import snapshot_download; snapshot_download('Systran/faster-whisper-large-v3', local_dir='models/large-v3')"
+```
+
+Дождитесь окончания скачивания. В `models/large-v3` должны находиться файлы модели, включая `model.bin`, `config.json` и `tokenizer.json`. При работе сервис использует только локальную модель. `ASR_MODEL` задаёт имя её каталога внутри `models`, по умолчанию `large-v3`; Compose передаёт одинаковое значение Core и Worker. Для другой совместимой модели сначала подготовьте её каталог, затем измените `ASR_MODEL` и пересоздайте оба компонента. Для локального CLI переменную нужно задать в окружении оболочки: CLI не загружает `.env` автоматически.
+
+## Владелец задач Core
+
+`CORE_OWNER_ID` — положительный числовой ID владельца задач и истории Core API. В Compose можно задать его в `.env`; если значение отсутствует или пустое, используется `TELEGRAM_ALLOWED_USER_ID`, затем `1`. Для существующей истории сохраняйте прежний ID: изменение владельца переключит отображаемую историю. При независимом запуске Core задайте `CORE_OWNER_ID` в окружении процесса (по умолчанию `1`); `TELEGRAM_ALLOWED_USER_ID` обязателен только для Telegram Adapter. После изменения настройки Compose пересоздайте Core: `docker compose up -d core-api`.
+
 ## Telegram
 
 `MAX_FILE_SIZE_MB` в `.env` задаёт максимальный размер входящего файла: по умолчанию 1024 МиБ. Допустимо положительное конечное число, включая дробное; неверное значение останавливает запуск с ошибкой конфигурации. `MAX_DURATION_SECONDS` ограничивает длительность декодированного аудио (по умолчанию 43200 секунд, 12 часов). Существующее значение `MAX_FILE_SIZE_MB` в вашем `.env` сохраняется; для больших файлов увеличьте его вручную. После изменения пересоздайте контейнеры: `docker compose up -d --build telegram-adapter core-api whisper-worker`.

@@ -9,7 +9,8 @@ import numpy as np
 from faster_whisper import WhisperModel
 from av.error import FFmpegError
 
-from nova_transcriber.config import check_disk_space, get_max_file_size_mb, get_positive_int
+from nova_transcriber.stages import LOADING_MODEL, READING_AUDIO, TRANSCRIBING
+from nova_transcriber.config import get_asr_model, check_disk_space, get_max_file_size_mb, get_positive_int
 from nova_transcriber.errors import EmptyFileError, MediaError, UnreadableMediaError
 
 
@@ -20,7 +21,7 @@ OVERLAP_SAMPLES = 5 * SAMPLE_RATE
 
 @cache
 def _get_model() -> WhisperModel:
-    model_path = Path("models/large-v3").resolve()
+    model_path = (Path("models") / get_asr_model()).resolve()
     if not model_path.is_dir():
         raise FileNotFoundError(f"Каталог модели не найден: {model_path}")
     return WhisperModel(
@@ -110,13 +111,13 @@ def transcribe_chunks(path, *, start_sample=0, on_status=None, on_progress=None)
         if on_status is not None:
             on_status(text)
 
-    status("Загрузка модели")
+    status(LOADING_MODEL)
     model = _get_model()
-    status("Чтение аудио")
+    status(READING_AUDIO)
     position = start_sample
     for audio, left_context, core_samples in _audio_chunks(path, start_sample):
         check_disk_space(Path(path).parent)
-        status("Распознавание")
+        status(TRANSCRIBING)
         segments, _ = model.transcribe(
             audio, language="ru", task="transcribe", vad_filter=False,
             word_timestamps=True,
@@ -136,7 +137,7 @@ def transcribe_chunks(path, *, start_sample=0, on_status=None, on_progress=None)
         yield position, text
         del segments, audio, words
         gc.collect()
-        status("Чтение аудио")
+        status(READING_AUDIO)
 
 
 def transcribe(path: str | Path, *, on_status: Callable[[str], None] | None = None) -> str:

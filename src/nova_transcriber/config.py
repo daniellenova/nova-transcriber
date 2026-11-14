@@ -40,3 +40,10 @@ def get_owner_id(name="TELEGRAM_ALLOWED_USER_ID", default=None) -> int:
     except (TypeError, ValueError):
         raise ValueError(f"{name} должен быть положительным целым числом в диапазоне BIGINT") from None
     return value
+
+
+def get_asr_model() -> str:
+    value = os.environ.get('ASR_MODEL', 'large-v3')
+    if not value or value in {'.', '..'} or any(c in value for c in ('/', '\\', '\x00')):
+        raise ValueError('ASR_MODEL должен быть именем каталога модели внутри models')
+    return value

@@ -658,6 +658,7 @@ worker = [
     { name = "av" },
     { name = "ctranslate2" },
     { name = "faster-whisper" },
+    { name = "numpy" },
 ]
 
 [package.metadata]
@@ -667,6 +668,7 @@ requires-dist = [
     { name = "ctranslate2", marker = "extra == 'worker'", specifier = "==4.7.2" },
     { name = "faster-whisper", marker = "extra == 'worker'", specifier = ">=1.2.1" },
     { name = "loguru", specifier = ">=0.7.3" },
+    { name = "numpy", marker = "extra == 'worker'" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.3.8" },
     { name = "tzdata", marker = "sys_platform == 'win32'" },
 ]
